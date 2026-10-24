@@ -25,13 +25,21 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    # NB: build_uefi.py does `import tomllib`, which is Python 3.11+. ubuntu-22.04 ships 3.10 and fails.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       FD_BASE: ${{ github.event.inputs.fd_base }}
       FD_SIZE: ${{ github.event.inputs.fd_size }}
       PAYLOAD_BASE: ${{ github.event.inputs.payload_base }}
     steps:
+      - name: toolchain versions
+        run: |
+          python3 -V
+          gcc --version | head -1
+          nasm -v
+          iasl -v | head -2
+
       - name: packages
         run: |
           sudo apt-get update
@@ -53,6 +61,7 @@ jobs:
 
       - name: apply the HackiOS changes
         run: |
+          # git -C changes the working directory, so the patch has to be an ABSOLUTE path here
           git -C Mu-Silicium apply --whitespace=nowarn "$GITHUB_WORKSPACE/hackios/uefi/mu-silicium.patch"
           cp -r hackios/uefi/files/. Mu-Silicium/
           grep -c XNUP Mu-Silicium/BootShim/BootShim.S
@@ -70,6 +79,10 @@ jobs:
       - name: build the FD
         run: |
           python3 -m venv venv
+          # build_uefi.py needs tomllib (Python 3.11+); fail here instead of inside the script
+          venv/bin/python -c "import tomllib" || {
+            echo "the venv python is $(venv/bin/python -V 2>&1): no tomllib, use ubuntu-24.04 or install python3.11"
+            exit 1; }
           venv/bin/pip install -q --upgrade pip
           venv/bin/pip install -q -r Mu-Silicium/pip-requirements.txt
           cd Mu-Silicium
