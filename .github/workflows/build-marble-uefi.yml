@@ -53,7 +53,7 @@ jobs:
 
       - name: apply the HackiOS changes
         run: |
-          git -C Mu-Silicium apply --whitespace=nowarn hackios/uefi/mu-silicium.patch
+          git -C Mu-Silicium apply --whitespace=nowarn "$GITHUB_WORKSPACE/hackios/uefi/mu-silicium.patch"
           cp -r hackios/uefi/files/. Mu-Silicium/
           grep -c XNUP Mu-Silicium/BootShim/BootShim.S
           test -f Mu-Silicium/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/XnuLoader.c
