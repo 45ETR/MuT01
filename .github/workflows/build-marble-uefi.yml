@@ -55,7 +55,7 @@ jobs:
         run: |
           grep -rn 'marble/AcpiTables.inf' Mu-Silicium/Platforms/Xiaomi/marblePkg || true
           for f in $(grep -rl 'marble/AcpiTables\.inf' Mu-Silicium/Platforms/Xiaomi/marblePkg); do
-            sed -i '/^[[:space:]]*#/!s|marble/AcpiTables\.inf|# &|' "$f"
+            sed -i '/marble\/AcpiTables\.inf/{/^[[:space:]]*#/!s|^|# |}' "$f"
             echo "patched $f"
           done
           grep -rn 'AcpiTables' Mu-Silicium/Platforms/Xiaomi/marblePkg || true
