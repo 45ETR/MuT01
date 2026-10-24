@@ -33,13 +33,6 @@ jobs:
       FD_SIZE: ${{ github.event.inputs.fd_size }}
       PAYLOAD_BASE: ${{ github.event.inputs.payload_base }}
     steps:
-      - name: toolchain versions
-        run: |
-          python3 -V
-          gcc --version | head -1
-          nasm -v
-          iasl -v | head -2
-
       - name: packages
         run: |
           sudo apt-get update
@@ -47,6 +40,13 @@ jobs:
             build-essential uuid-dev iasl nasm acpica-tools \
             python3 python3-venv python3-pip python3-dev \
             gcc-aarch64-linux-gnu
+
+      - name: toolchain versions (after packages: nasm/iasl come from them)
+        run: |
+          python3 -V
+          gcc --version | head -1
+          nasm -v
+          iasl -v | head -2
 
       - name: hackios uefi port (patch + files)
         run: git clone --depth 1 https://github.com/oosexgang/hackios-xnu-kernel.git hackios
