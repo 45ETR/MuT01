@@ -1,77 +1,47 @@
-# Build the HackiOS-patched marble UEFI on GitHub's runners, so the only thing that has to cross a
-# slow link is a ~3 MB artifact instead of a 1 GB+ Mu-Silicium tree.
-#
-# How to use:
-#   1. create an empty public repo (e.g. marble-uefi), put this file at .github/workflows/build-marble-uefi.yml
-#   2. push it, open the Actions tab, run "build-marble-uefi"
-#   3. download the "marble-uefi" artifact (SILICIUM_UEFI.fd + BootShim.bin)
-#
-# It clones hackios-xnu-kernel (patch + new files), Mu-Silicium at the commit uefi/BASE pins,
-# applies the two HackiOS changes, and builds marblePkg for RELEASE.
-name: build-marble-uefi
+# Minimal, copy-paste-safe version of build-marble-uefi.yml.
+# No workflow_dispatch inputs, no heredocs, no shell functions -- fewer chances to break while pasting.
+# Put it at .github/workflows/marble-uefi.yml on the DEFAULT branch, then Actions -> marble-uefi -> Run workflow.
+name: marble-uefi
 
 on:
   workflow_dispatch:
-    inputs:
-      fd_base:
-        description: 'FD_BASE (marble: 0xA7100000)'
-        default: '0xA7100000'
-      fd_size:
-        description: 'FD_SIZE (marble: 0x300000)'
-        default: '0x300000'
-      payload_base:
-        description: 'PAYLOAD_BASE (64 KiB aligned)'
-        default: '0xAA000000'
 
 jobs:
   build:
-    # NB: build_uefi.py does `import tomllib`, which is Python 3.11+. ubuntu-22.04 ships 3.10 and fails.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      FD_BASE: ${{ github.event.inputs.fd_base }}
-      FD_SIZE: ${{ github.event.inputs.fd_size }}
-      PAYLOAD_BASE: ${{ github.event.inputs.payload_base }}
+      FD_BASE: "0xA7100000"
+      FD_SIZE: "0x300000"
+      PAYLOAD_BASE: "0xAA000000"
+
     steps:
-      # pins the interpreter regardless of what the runner image ships: build_uefi.py needs tomllib (3.11+)
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: packages
+      - name: dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential uuid-dev iasl nasm acpica-tools \
-            python3 python3-venv python3-pip python3-dev \
-            gcc-aarch64-linux-gnu
+            python3-venv python3-dev gcc-aarch64-linux-gnu
 
-      - name: toolchain versions (after packages: nasm/iasl come from them)
-        run: |
-          python3 -V
-          gcc --version | head -1
-          nasm -v
-          iasl -v | head -2
-
-      - name: hackios uefi port (patch + files)
+      - name: clone hackios (patch + files)
         run: git clone --depth 1 https://github.com/oosexgang/hackios-xnu-kernel.git hackios
 
-      - name: Mu-Silicium at the pinned commit
+      - name: clone Mu-Silicium at the pinned commit
         run: |
           BASE=$(tr -d ' \n' < hackios/uefi/BASE)
-          echo "BASE=$BASE" >> "$GITHUB_ENV"
           git clone https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
           git -C Mu-Silicium checkout "$BASE"
-          git -C Mu-Silicium submodule update --init --recursive
+          git -C Mu-Silicium submodule update --init --recursive --jobs 4
 
       - name: apply the HackiOS changes
         run: |
-          # git -C changes the working directory, so the patch has to be an ABSOLUTE path here
           git -C Mu-Silicium apply --whitespace=nowarn "$GITHUB_WORKSPACE/hackios/uefi/mu-silicium.patch"
           cp -r hackios/uefi/files/. Mu-Silicium/
           grep -c XNUP Mu-Silicium/BootShim/BootShim.S
-          test -f Mu-Silicium/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/XnuLoader.c
-          test -d Mu-Silicium/Platforms/Xiaomi/marblePkg
 
       - name: mu_nasm without Mono
         run: |
@@ -83,35 +53,24 @@ jobs:
 
       - name: build the FD
         run: |
-          echo "python3 on PATH: $(command -v python3) $(python3 -V 2>&1)"
-          python3 -m venv --clear venv
-          # build_uefi.py needs tomllib (Python 3.11+); fail here instead of inside the script
-          venv/bin/python -c "import tomllib" || {
-            echo "the venv python is $(venv/bin/python -V 2>&1): no tomllib -> wrong python"
-            exit 1; }
+          python3 -m venv venv
+          venv/bin/python -c "import tomllib"
           venv/bin/pip install -q --upgrade pip
           venv/bin/pip install -q -r Mu-Silicium/pip-requirements.txt
           cd Mu-Silicium
-          # call the venv interpreter explicitly: `source activate` alone has bitten us once already
           ../venv/bin/python build_uefi.py -d marble -r RELEASE
 
-      - name: build the boot shim for marble's addresses
+      - name: build the boot shim
         run: |
           make -C Mu-Silicium/BootShim REQUIRES_KERNEL_HEADER=1 \
             FD_BASE="$FD_BASE" FD_SIZE="$FD_SIZE" \
             CFLAGS="--target=aarch64-linux-gnu -DPAYLOAD_BASE=$PAYLOAD_BASE"
-          ls -l Mu-Silicium/BootShim/BootShim.bin
 
-      - name: check sizes
+      - name: check the artifact sizes
         run: |
           FD=Mu-Silicium/Build/marblePkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
           ls -l "$FD" Mu-Silicium/BootShim/BootShim.bin
-          python3 - "$FD" "$FD_SIZE" <<'PY'
-          import os, sys
-          size, want = os.path.getsize(sys.argv[1]), int(sys.argv[2], 0)
-          print(f"FD {size} bytes, expected {want}")
-          sys.exit(0 if size == want else 1)
-          PY
+          test "$(stat -c %s "$FD")" -eq 3145728
 
       - uses: actions/upload-artifact@v4
         with:
