@@ -24,8 +24,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential uuid-dev iasl nasm acpica-tools \
+            build-essential uuid-dev iasl nasm acpica-tools llvm \
             python3-venv python3-dev gcc-aarch64-linux-gnu
+
+      - name: put llvm-objcopy on PATH
+        run: |
+          if ! command -v llvm-objcopy >/dev/null; then
+            P=$(ls /usr/lib/llvm-*/bin/llvm-objcopy 2>/dev/null | sort -V | tail -1)
+            [ -n "$P" ] && sudo ln -sf "$P" /usr/local/bin/llvm-objcopy
+          fi
+          command -v llvm-objcopy
 
       - name: clone hackios (patch + files)
         run: git clone --depth 1 https://github.com/oosexgang/hackios-xnu-kernel.git hackios
