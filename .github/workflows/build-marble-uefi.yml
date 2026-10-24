@@ -51,6 +51,18 @@ jobs:
           cp -r hackios/uefi/files/. Mu-Silicium/
           grep -c XNUP Mu-Silicium/BootShim/BootShim.S
 
+      - name: drop ACPI tables if marblePkg has none
+        run: |
+          if find Mu-Silicium -name 'AcpiTables.inf' | grep -q .; then
+            echo "AcpiTables.inf present, keeping the module"
+            exit 0
+          fi
+          sed -i 's|^  marble/AcpiTables.inf|#  marble/AcpiTables.inf|' \
+            Mu-Silicium/Platforms/Xiaomi/marblePkg/marble.dsc
+          sed -i 's|^  INF RuleOverride = ACPITABLE marble/AcpiTables.inf|#  INF RuleOverride = ACPITABLE marble/AcpiTables.inf|' \
+            Mu-Silicium/Platforms/Xiaomi/marblePkg/marble.fdf
+          echo "ACPI module removed (XNU uses a device tree, not ACPI)"
+
       - name: mu_nasm without Mono
         run: |
           D=Mu-Silicium/Mu_Basecore/BaseTools/Bin/mu_nasm_extdep
