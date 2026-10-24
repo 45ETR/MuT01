@@ -51,6 +51,12 @@ jobs:
           cp -r hackios/uefi/files/. Mu-Silicium/
           grep -c XNUP Mu-Silicium/BootShim/BootShim.S
 
+      - name: point the XnuLoader hook at marble's PAYLOAD_BASE
+        run: |
+          H=Mu-Silicium/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/XnuLoader.h
+          sed -i 's|^#define XNU_PAYLOAD_BASE .*|#define XNU_PAYLOAD_BASE      0xAA000000ULL|' "$H"
+          grep -n 'XNU_PAYLOAD_BASE' "$H"
+
       - name: comment out the marble ACPI references
         run: |
           grep -rn 'marble/AcpiTables.inf' Mu-Silicium/Platforms/Xiaomi/marblePkg || true
