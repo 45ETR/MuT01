@@ -89,10 +89,14 @@ jobs:
           cd hackios
           xnu/apply.sh
           if ! xnu-deps/setup.sh; then
-            echo "===== setup failed; the interesting lines of exporthdrs.log ====="
-            grep -n -B10 -A15 'error:' xnu-deps/exporthdrs.log 2>/dev/null | head -150 || true
-            echo "===== tail of exporthdrs.log ====="
-            tail -40 xnu-deps/exporthdrs.log 2>/dev/null || echo "(no exporthdrs.log)"
+            echo "===== setup failed: every error-ish line of exporthdrs.log ====="
+            grep -niE 'error|fatal|cannot find|undefined reference|no such file' \
+              xnu-deps/exporthdrs.log 2>/dev/null | tail -40 || true
+            echo "===== context around the first error ====="
+            grep -niE -B8 -A12 'error|fatal|cannot find|undefined reference|no such file' \
+              xnu-deps/exporthdrs.log 2>/dev/null | head -160 || true
+            echo "===== last 60 lines of exporthdrs.log ====="
+            tail -60 xnu-deps/exporthdrs.log 2>/dev/null || echo "(no exporthdrs.log)"
             exit 1
           fi
           # the export check after linking is expected to fail (xnu/README.md); judge by the file
