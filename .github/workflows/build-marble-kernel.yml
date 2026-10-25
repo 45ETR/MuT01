@@ -89,6 +89,16 @@ jobs:
           grep -n 'exec\|-B\|ftrivial' "$W" | head
           ls -l hackios/xnu-deps/host/ldbin/ld
 
+      - name: a dsymutil stub (Linux has none, and an empty DSYMUTIL runs "--minimize")
+        run: |
+          # MakeInc.kernel calls `$(DSYMUTIL) --minimize ...`; DSYMUTIL comes from `xcrun -find dsymutil`,
+          # which searches xnu-deps/host/bin and /usr/bin. Neither has it on Linux, so the variable ends
+          # up empty and the shell tries to execute the next word: "bash: --minimize: command not found".
+          printf '#!/bin/sh\n# dSYM generation is irrelevant here; succeed and let the build continue\nexit 0\n' \
+            > hackios/xnu-deps/host/bin/dsymutil
+          chmod +x hackios/xnu-deps/host/bin/dsymutil
+          hackios/xnu-deps/host/bin/xcrun -find dsymutil
+
       - name: apply the XNU patches and build
         run: |
           cd hackios
