@@ -90,11 +90,13 @@ jobs:
           xnu/apply.sh
           if ! xnu-deps/setup.sh; then
             echo "===== setup failed: error-ish lines of exporthdrs.log ====="
-            grep -niE 'error|fatal|cannot find|undefined reference|no such file' \
+            grep -niE 'error|fatal|cannot find|undefined reference|no such file|unrecognized|unsupported|not found' \
               xnu-deps/exporthdrs.log 2>/dev/null | tail -40 || true
             echo "===== context around the first error ====="
-            grep -niE -B8 -A12 'error|fatal|cannot find|undefined reference|no such file' \
-              xnu-deps/exporthdrs.log 2>/dev/null | head -160 || true
+            grep -niE -B10 -A14 'error|fatal|cannot find|undefined reference|no such file|unrecognized|unsupported' \
+              xnu-deps/exporthdrs.log 2>/dev/null | head -200 || true
+            echo "===== last 120 lines of exporthdrs.log (always, so nothing is hidden) ====="
+            tail -120 xnu-deps/exporthdrs.log 2>/dev/null || echo "(no exporthdrs.log)"
             exit 1
           fi
           # xnu/README.md: the build always ends with the check_all_exports error; the kernel is linked
