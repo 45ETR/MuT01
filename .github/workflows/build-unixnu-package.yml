@@ -25,6 +25,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: python 3.12 provides tomllib (Ubuntu 22.04 ships 3.10)
+        run: |
+          python3 --version
+          python3 -c "import tomllib; print('tomllib ok')"
       - name: host dependencies
         run: |
           sudo apt-get update
