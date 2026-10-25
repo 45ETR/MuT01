@@ -89,16 +89,16 @@ jobs:
           grep -n 'exec\|-B\|ftrivial' "$W" | head
           ls -l hackios/xnu-deps/host/ldbin/ld
 
-      - name: a dsymutil stub (Linux has none, and an empty DSYMUTIL runs "--minimize")
+      - name: a dsymutil that produces the layout the makefile moves around
         run: |
-          # MakeInc.kernel calls `$(DSYMUTIL) --minimize ...`; DSYMUTIL comes from `xcrun -find dsymutil`,
-          # which searches xnu-deps/host/bin and /usr/bin. Neither has it on Linux, so the variable ends
-          # up empty and the shell tries to execute the next word: "bash: --minimize: command not found".
-          printf '#!/bin/sh\n# dSYM generation is irrelevant here; succeed and let the build continue\nexit 0\n' \
-            > hackios/xnu-deps/host/bin/dsymutil
+          # MakeInc.kernel runs `$(DSYMUTIL) -o X.dSYM <binary>` and then MOVES
+          # X.dSYM/Contents/Resources/DWARF/<binary>. Linux has no dsymutil (and an empty DSYMUTIL makes
+          # the shell run "--minimize"), so provide one that creates exactly that file.
+          echo 'IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwojIGRzeW11dGlsIGZvciBMaW51eDogdGhlcmUgaXMgbm8gZGVidWctc3ltYm9sIGJ1bmRsZXIgaGVyZSwgYnV0IHRoZSBYTlUgbWFrZWZpbGUgc3RpbGwgZXhwZWN0cyB0aGUKIyBvdXRwdXQgbGF5b3V0IChkc3ltdXRpbCAtbyBYLmRTWU0gPGJpbmFyeT4gcHV0cyB0aGUgRFdBUkYgZmlsZSBhdCBYLmRTWU0vQ29udGVudHMvUmVzb3VyY2VzL0RXQVJGLzxuYW1lPikKIyBhbmQgdGhlbiBtb3ZlcyB0aGF0IGZpbGUuIENyZWF0ZSBpdCAoYSBjb3B5IG9mIHRoZSBpbnB1dCkgYW5kIHN1Y2NlZWQuCmltcG9ydCBvcywgc2h1dGlsLCBzeXMKCmFyZ3MgPSBzeXMuYXJndlsxOl0Kb3V0ID0gc3JjID0gTm9uZQppID0gMAp3aGlsZSBpIDwgbGVuKGFyZ3MpOgogICAgYSA9IGFyZ3NbaV0KICAgIGlmIGEgaW4gKCctbycsICctLW91dCcpOgogICAgICAgIG91dCA9IGFyZ3NbaSArIDFdOyBpICs9IDI7IGNvbnRpbnVlCiAgICBpZiBhLnN0YXJ0c3dpdGgoJy1vJykgYW5kIGxlbihhKSA+IDI6CiAgICAgICAgb3V0ID0gYVsyOl07IGkgKz0gMTsgY29udGludWUKICAgIGlmIG5vdCBhLnN0YXJ0c3dpdGgoJy0nKToKICAgICAgICBzcmMgPSBhCiAgICBpICs9IDEKCmlmIG91dCBhbmQgc3JjOgogICAgZCA9IG9zLnBhdGguam9pbihvdXQsICdDb250ZW50cycsICdSZXNvdXJjZXMnLCAnRFdBUkYnKQogICAgb3MubWFrZWRpcnMoZCwgZXhpc3Rfb2s9VHJ1ZSkKICAgIHRyeToKICAgICAgICBzaHV0aWwuY29weTIoc3JjLCBvcy5wYXRoLmpvaW4oZCwgb3MucGF0aC5iYXNlbmFtZShzcmMpKSkKICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgIHBhc3MKc3lzLmV4aXQoMCk=' \
+            | base64 -d > hackios/xnu-deps/host/bin/dsymutil
           chmod +x hackios/xnu-deps/host/bin/dsymutil
-          # (no `xcrun -find` here: it needs XNU_SDK_PATH, which only xnu-env.sh exports)
-          ls -l hackios/xnu-deps/host/bin/dsymutil
+          python3 -c "import ast,sys; ast.parse(open('hackios/xnu-deps/host/bin/dsymutil').read()); print('dsymutil stub: python ok')"
+          head -3 hackios/xnu-deps/host/bin/dsymutil
 
       - name: apply the XNU patches and build
         run: |
