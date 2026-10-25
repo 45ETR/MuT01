@@ -32,10 +32,10 @@ jobs:
         run: |
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 18
+          sudo /tmp/llvm.sh 22
           # put it first in PATH so both HOST_CC and the xnu-clang wrapper use it
-          sudo ln -sf /usr/bin/clang-18    /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-18  /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/clang-22    /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-22  /usr/local/bin/clang++
           clang --version | head -2
 
       - name: theos, its cctools (ld64) and the SDK
