@@ -73,7 +73,13 @@ jobs:
           test -x "$HOME/theos/toolchain/linux/iphone/bin/clang"
           sed -i 's|exec /usr/bin/\$drv|exec "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/$drv"|' \
             hackios/xnu-deps/host/bin/xnu-clang
-          grep -n '^exec' hackios/xnu-deps/host/bin/xnu-clang
+
+          # that clang is version 11: --ld-path= arrived in clang 12. In clang 11 the linker is picked
+          # with -B<dir> (a directory containing `ld`), so link cctools' ld64 as host/bin/ld and use -B.
+          ln -sf ld64 hackios/xnu-deps/host/bin/ld
+          perl -0pi -e 's|--ld-path="\$HB/ld64"|-B"\$HB"|' hackios/xnu-deps/host/bin/xnu-clang
+          grep -n 'exec\|-B' hackios/xnu-deps/host/bin/xnu-clang
+          ls -l hackios/xnu-deps/host/bin/ld
           "$HOME/theos/toolchain/linux/iphone/bin/clang" --version | head -2
 
       - name: let the build pass with any clang (drops Apple-only flags)
