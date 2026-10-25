@@ -65,13 +65,21 @@ jobs:
             echo "marble/redwood_goodix.c not in the repo: building the stock redwood driver"
           fi
 
-      - name: let the build pass with the distro's clang instead of Apple's
+      - name: use the theos Apple clang, like the HackiOS developers do
         run: |
-          # xnu-clang already drops flags only Apple's clang understands; -ftrivial-auto-var-init is
-          # another one. Ubuntu's clang refuses it unless given an extra opt-in flag, and XNU passes it
-          # for every BSD object (fasttrap.o, systrace.o, init_sysent.o ... all failed on it).
-          # (a perl one-liner on purpose: a heredoc inside this block scalar would keep its indentation
-          #  and Python would choke on the leading spaces)
+          # xnu-clang execs /usr/bin/clang (Ubuntu's LLVM build). A kernel cross-built for XNU's early
+          # boot with a different compiler hangs before its console exists, so point the wrapper at the
+          # Apple clang that comes with the theos toolchain we already downloaded.
+          test -x "$HOME/theos/toolchain/linux/iphone/bin/clang"
+          sed -i 's|exec /usr/bin/\$drv|exec "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/$drv"|' \
+            hackios/xnu-deps/host/bin/xnu-clang
+          grep -n '^exec' hackios/xnu-deps/host/bin/xnu-clang
+          "$HOME/theos/toolchain/linux/iphone/bin/clang" --version | head -2
+
+      - name: let the build pass with any clang (drops Apple-only flags)
+        run: |
+          # XNU passes -ftrivial-auto-var-init=zero, which only Apple's clang accepts silently; keeping
+          # the wrapper's drop-list means the build works whichever clang ends up behind it.
           perl -0pi -e 's/    -fapple-kext-vtable-verify/    -ftrivial-auto-var-init=*|-fapple-kext-vtable-verify/' \
             hackios/xnu-deps/host/bin/xnu-clang
           grep -n 'trivial-auto-var-init' hackios/xnu-deps/host/bin/xnu-clang
