@@ -1,4 +1,4 @@
-﻿# Build the marble XNU kernel on GitHub's runners, so the 200 MB Linux toolchain never crosses your link.
+# Build the marble XNU kernel on GitHub's runners, so the 200 MB Linux toolchain never crosses your link.
 #
 # What it does:
 #   - installs theos + the prebuilt Linux iOS toolchain + iPhoneOS16.5.sdk (all at runner speed)
@@ -64,6 +64,17 @@ jobs:
           else
             echo "marble/redwood_goodix.c not in the repo: building the stock redwood driver"
           fi
+
+      - name: let the build pass with the distro's clang instead of Apple's
+        run: |
+          # xnu-clang already drops flags only Apple's clang understands; -ftrivial-auto-var-init is
+          # another one. Ubuntu's clang refuses it unless given an extra opt-in flag, and XNU passes it
+          # for every BSD object (fasttrap.o, systrace.o, init_sysent.o ... all failed on it).
+          # (a perl one-liner on purpose: a heredoc inside this block scalar would keep its indentation
+          #  and Python would choke on the leading spaces)
+          perl -0pi -e 's/    -fapple-kext-vtable-verify/    -ftrivial-auto-var-init=*|-fapple-kext-vtable-verify/' \
+            hackios/xnu-deps/host/bin/xnu-clang
+          grep -n 'trivial-auto-var-init' hackios/xnu-deps/host/bin/xnu-clang
 
       - name: apply the XNU patches and build
         run: |
