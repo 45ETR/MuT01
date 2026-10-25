@@ -1,0 +1,73 @@
+# Build the marble XNU kernel on GitHub's runners, so the 200 MB Linux toolchain never crosses your link.
+#
+# What it does:
+#   - installs theos + the prebuilt Linux iOS toolchain + iPhoneOS16.5.sdk (all at runner speed)
+#   - clones hackios-xnu-kernel
+#   - if this repository has marble/redwood_goodix.c, it replaces the stock touch driver with it
+#   - xnu/apply.sh -> xnu-deps/setup.sh -> xnu-build.sh
+#   - uploads mach.development.bcm2837 (~15 MB)
+#
+# How to use: put this file at .github/workflows/build-marble-kernel.yml in your CI repo
+# (the same one that built the UEFI), commit the touch driver as marble/redwood_goodix.c, and run it.
+name: build-marble-kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool bison flex m4 perl \
+            python3 python3-pip python3-venv libtinfo6 libxml2 zip rsync curl \
+            xz-utils libssl-dev pkg-config zlib1g-dev clang lld llvm
+
+      - name: theos + toolchain + SDK
+        run: |
+          git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          mkdir -p "$HOME/theos/toolchain" "$HOME/theos/sdks"
+          curl -L --retry 5 --retry-delay 3 -o /tmp/tc.tar.xz \
+            https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz
+          tar -xJf /tmp/tc.tar.xz -C "$HOME/theos/toolchain/"
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          git -C /tmp/sdks sparse-checkout set iPhoneOS16.5.sdk
+          mv /tmp/sdks/iPhoneOS16.5.sdk "$HOME/theos/sdks/"
+          test -x "$HOME/theos/toolchain/linux/iphone/bin/ld"
+          test -d "$HOME/theos/sdks/iPhoneOS16.5.sdk/usr/include"
+          echo "theos: $($HOME/theos/toolchain/linux/iphone/bin/clang --version | head -1)"
+
+      - name: hackios source
+        run: git clone --depth 1 https://github.com/oosexgang/hackios-xnu-kernel.git hackios
+
+      - name: use the marble touch driver from this repository, if present
+        run: |
+          if [ -f marble/redwood_goodix.c ]; then
+            cp marble/redwood_goodix.c hackios/xnu/files/bsd/dev/redwood_goodix.c
+            grep -n 'TLMM_PHYS\|PIN_INT \|SE_PHYS' hackios/xnu/files/bsd/dev/redwood_goodix.c | head
+          else
+            echo "marble/redwood_goodix.c not in the repo: building the stock redwood driver"
+          fi
+
+      - name: apply the XNU patches and build
+        run: |
+          cd hackios
+          xnu/apply.sh
+          xnu-deps/setup.sh
+          # the export check after linking is expected to fail (xnu/README.md); judge by the file
+          ./xnu-build.sh -j"$(nproc)" -k || true
+          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          ls -l "$K"
+          test -s "$K"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marble-kernel
+          if-no-files-found: error
+          path: hackios/xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
