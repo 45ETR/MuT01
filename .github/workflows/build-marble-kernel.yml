@@ -97,7 +97,8 @@ jobs:
           printf '#!/bin/sh\n# dSYM generation is irrelevant here; succeed and let the build continue\nexit 0\n' \
             > hackios/xnu-deps/host/bin/dsymutil
           chmod +x hackios/xnu-deps/host/bin/dsymutil
-          hackios/xnu-deps/host/bin/xcrun -find dsymutil
+          # (no `xcrun -find` here: it needs XNU_SDK_PATH, which only xnu-env.sh exports)
+          ls -l hackios/xnu-deps/host/bin/dsymutil
 
       - name: apply the XNU patches and build
         run: |
