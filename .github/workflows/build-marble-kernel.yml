@@ -26,8 +26,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential autoconf automake libtool bison flex m4 perl \
-            python3 python3-pip python3-venv libtinfo6 libxml2 zip rsync curl \
-            xz-utils libssl-dev pkg-config zlib1g-dev clang lld llvm
+            python3 python3-pip python3-venv libtinfo5 libtinfo6 libncurses5 libxml2 \
+            zip rsync curl xz-utils libssl-dev pkg-config zlib1g-dev clang lld llvm
 
       - name: theos + toolchain + SDK
         run: |
@@ -59,12 +59,23 @@ jobs:
         run: |
           cd hackios
           xnu/apply.sh
-          xnu-deps/setup.sh
+          if ! xnu-deps/setup.sh; then
+            echo "===== setup failed; xnu-deps/exporthdrs.log ====="
+            tail -80 xnu-deps/exporthdrs.log 2>/dev/null || echo "(no exporthdrs.log)"
+            echo "===== tail of the newest build log, if any ====="
+            ls -t xnu-src/xnu-8796.121.2/BUILD/*.log 2>/dev/null | head -2
+            exit 1
+          fi
           # the export check after linking is expected to fail (xnu/README.md); judge by the file
           ./xnu-build.sh -j"$(nproc)" -k || true
           K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          if [ ! -s "$K" ]; then
+            echo "===== no kernel; last 80 lines of the build log ====="
+            tail -80 xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/*.log 2>/dev/null || true
+            tail -80 "$(ls -t xnu-src/xnu-8796.121.2/BUILD/*.log 2>/dev/null | head -1)" 2>/dev/null || true
+            exit 1
+          fi
           ls -l "$K"
-          test -s "$K"
 
       - uses: actions/upload-artifact@v4
         with:
