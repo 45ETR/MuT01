@@ -115,6 +115,17 @@ jobs:
             tail -120 xnu-deps/exporthdrs.log 2>/dev/null || echo "(no exporthdrs.log)"
             exit 1
           fi
+          # The prebuilt kernel carries ~1050 ath11k_* symbols that a build without this step lacks,
+          # and that ~660 KB is the whole difference in size (50073 vs 49021 symbols otherwise equal).
+          # It downloads Linux 7.0.14 and FreeBSD 15.1 sources and compiles the driver into
+          # xnu-deps/build/ath11k/out/ath11k.o, which xnu-build.sh links when it is there.
+          echo "===== Wi-Fi driver (ath11k) ====="
+          if ! tools/mk-ath11k.sh; then
+            echo "mk-ath11k.sh failed; continuing without the Wi-Fi driver"
+          else
+            tools/mk-wlfw.sh || echo "mk-wlfw.sh failed"
+            ls -l xnu-deps/build/ath11k/out/ath11k.o || true
+          fi
           # xnu/README.md: the build always ends with the check_all_exports error; the kernel is linked
           # and usable by then, so judge by the file, not by make's exit status.
           ./xnu-build.sh -j"$(nproc)" -k || true
