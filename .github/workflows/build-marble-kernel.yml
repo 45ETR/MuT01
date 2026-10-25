@@ -77,12 +77,17 @@ jobs:
           W=hackios/xnu-deps/host/bin/xnu-clang
           # 1) the wrapper hardcodes /usr/bin/clang; use the clang 18 we put in /usr/local/bin
           sed -i 's|exec /usr/bin/\$drv|exec /usr/local/bin/$drv|' "$W"
-          # 2) cctools ld64 as host/bin/ld, found through -B (works on every clang version)
-          ln -sf ld64 hackios/xnu-deps/host/bin/ld
-          perl -0pi -e 's|--ld-path="\$HB/ld64"|-B"\$HB"|' "$W"
+          # 2) cctools ld64 for the *kernel* link, reached through -B. It must NOT sit in host/bin:
+          #    xnu-env.sh puts host/bin first on PATH, so a plain `ld` there is picked up by every
+          #    clang invocation, including the ELF host tools -- which then die with
+          #    "ld: unknown option: -z".
+          mkdir -p hackios/xnu-deps/host/ldbin
+          ln -sf ../bin/ld64 hackios/xnu-deps/host/ldbin/ld
+          perl -0pi -e 's|--ld-path="\$HB/ld64"|-B"\$HB/../ldbin"|' "$W"
           # 3) flags clang refuses: dropped, like the wrapper already does for other Apple-only ones
           perl -0pi -e 's/\Q    -fapple-kext-vtable-verify\E/    -ftrivial-auto-var-init=*|-fsanitize-ignorelist=*|-fsanitize-blacklist=*|-moutline-atomics|-fno-outline-atomics|-fapple-kext-vtable-verify/' "$W"
           grep -n 'exec\|-B\|ftrivial' "$W" | head
+          ls -l hackios/xnu-deps/host/ldbin/ld
 
       - name: apply the XNU patches and build
         run: |
