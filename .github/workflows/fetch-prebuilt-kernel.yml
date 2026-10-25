@@ -1,0 +1,28 @@
+# Fetch the ready-made kernel from hackios-xnu-kernel and hand it back as an artifact.
+#
+# Why: the file lives in GitHub's raw storage (15.6 MB), which is hard to reach from some networks,
+# while the runner can clone the repository without trouble. Run this, then download the artifact.
+name: fetch-prebuilt-kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: clone hackios and check the file
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/oosexgang/hackios-xnu-kernel.git hackios
+          git -C hackios sparse-checkout set prebuilt
+          ls -l hackios/prebuilt/
+          test -s hackios/prebuilt/mach.development.bcm2837
+          echo "size: $(stat -c %s hackios/prebuilt/mach.development.bcm2837) (the working one is 15623056)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-kernel
+          if-no-files-found: error
+          path: hackios/prebuilt/mach.development.bcm2837
