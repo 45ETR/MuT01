@@ -1,14 +1,12 @@
-# Build the marble XNU kernel on GitHub's runners, so the 200 MB Linux toolchain never crosses your link.
+# Build the marble XNU kernel on GitHub runners: the 200 MB Linux toolchain and the SDK never cross
+# your own link, only the ~15 MB kernel comes back.
 #
-# What it does:
-#   - installs theos + the prebuilt Linux iOS toolchain + iPhoneOS16.5.sdk (all at runner speed)
-#   - clones hackios-xnu-kernel
-#   - if this repository has marble/redwood_goodix.c, it replaces the stock touch driver with it
-#   - xnu/apply.sh -> xnu-deps/setup.sh -> xnu-build.sh
-#   - uploads mach.development.bcm2837 (~15 MB)
+# The kernel is built the way xnu/README.md says the developers build it: stock (new) clang, not the
+# clang 11 that ships inside the theos toolchain. clang 14 and clang 11 produced kernels that hang
+# before their console exists; README says it was tested with clang 22.
 #
-# How to use: put this file at .github/workflows/build-marble-kernel.yml in your CI repo
-# (the same one that built the UEFI), commit the touch driver as marble/redwood_goodix.c, and run it.
+# Put this file at .github/workflows/build-marble-kernel.yml in the CI repo. If the repo also has
+# marble/redwood_goodix.c, it replaces the stock touch driver before the build.
 name: build-marble-kernel
 
 on:
@@ -28,10 +26,21 @@ jobs:
             build-essential autoconf automake libtool bison flex m4 perl \
             python3 python3-pip python3-venv libtinfo5 libtinfo6 libncurses5 libxml2 \
             libbsd-dev uuid-dev libelf-dev libcap-dev \
-            zip rsync curl xz-utils libssl-dev pkg-config zlib1g-dev clang lld llvm
+            zip rsync curl wget xz-utils libssl-dev pkg-config zlib1g-dev lsb-release
 
-      - name: theos + toolchain + SDK
+      - name: clang 18 from apt.llvm.org
         run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 18
+          # put it first in PATH so both HOST_CC and the xnu-clang wrapper use it
+          sudo ln -sf /usr/bin/clang-18    /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-18  /usr/local/bin/clang++
+          clang --version | head -2
+
+      - name: theos, its cctools (ld64) and the SDK
+        run: |
+          # theos itself is only needed for toolchain/linux/iphone/bin/ld (cctools ld64) and the SDK
           git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
           mkdir -p "$HOME/theos/toolchain" "$HOME/theos/sdks"
           curl -L --retry 5 --retry-delay 3 -o /tmp/tc.tar.xz \
@@ -42,19 +51,17 @@ jobs:
           mv /tmp/sdks/iPhoneOS16.5.sdk "$HOME/theos/sdks/"
           test -x "$HOME/theos/toolchain/linux/iphone/bin/ld"
           test -d "$HOME/theos/sdks/iPhoneOS16.5.sdk/usr/include"
-          echo "theos: $($HOME/theos/toolchain/linux/iphone/bin/clang --version | head -1)"
 
       - name: hackios source
         run: git clone --depth 1 https://github.com/oosexgang/hackios-xnu-kernel.git hackios
 
       - name: glibc < 2.38 needs strlcat/strlcpy for the host tools
         run: |
-          # hackios was developed on Arch (glibc >= 2.38, which has strlcat/strlcpy in libc).
-          # Ubuntu 22.04 has glibc 2.35, so SETUP/replacecontents fails to link with
-          # "undefined reference to strlcat". hostcompat.h is force-included into every host tool.
-          # The snippet is base64 so no line of C can break this YAML block scalar.
-          echo 'Ci8qIGdsaWJjIG9ubHkgZ3JldyBzdHJsY3B5L3N0cmxjYXQgaW4gMi4zODsgdGhlIFhOVSBTRVRVUCB0b29scyB1c2UgYm90aC4gKi8KI2lmIGRlZmluZWQoX19saW51eF9fKSAmJiBkZWZpbmVkKF9fR0xJQkNfXykgJiYgKF9fR0xJQkNfXyA9PSAyICYmIF9fR0xJQkNfTUlOT1JfXyA8IDM4KQpzdGF0aWMgaW5saW5lIHNpemVfdApzdHJsY3B5KGNoYXIgKmRzdCwgY29uc3QgY2hhciAqc3JjLCBzaXplX3Qgc2l6KQp7CgljaGFyICpkID0gZHN0OwoJY29uc3QgY2hhciAqcyA9IHNyYzsKCXNpemVfdCBuID0gc2l6OwoKCWlmIChuICE9IDApIHsKCQl3aGlsZSAoLS1uICE9IDApIHsKCQkJaWYgKCgqZCsrID0gKnMrKykgPT0gJ1wwJykgewoJCQkJYnJlYWs7CgkJCX0KCQl9Cgl9CglpZiAobiA9PSAwKSB7CgkJaWYgKHNpeiAhPSAwKSB7CgkJCSpkID0gJ1wwJzsKCQl9CgkJd2hpbGUgKCpzKyspIHsKCQkJOwoJCX0KCX0KCXJldHVybiAoc2l6ZV90KShzIC0gc3JjIC0gMSk7Cn0KCnN0YXRpYyBpbmxpbmUgc2l6ZV90CnN0cmxjYXQoY2hhciAqZHN0LCBjb25zdCBjaGFyICpzcmMsIHNpemVfdCBzaXopCnsKCWNoYXIgKmQgPSBkc3Q7Cgljb25zdCBjaGFyICpzID0gc3JjOwoJc2l6ZV90IG4gPSBzaXo7CglzaXplX3QgZGxlbjsKCgl3aGlsZSAobi0tICE9IDAgJiYgKmQgIT0gJ1wwJykgewoJCWQrKzsKCX0KCWRsZW4gPSAoc2l6ZV90KShkIC0gZHN0KTsKCW4gPSBzaXogLSBkbGVuOwoKCWlmIChuID09IDApIHsKCQlyZXR1cm4gZGxlbiArIHN0cmxlbihzKTsKCX0KCXdoaWxlICgqcyAhPSAnXDAnKSB7CgkJaWYgKG4gIT0gMSkgewoJCQkqZCsrID0gKnM7CgkJCW4tLTsKCQl9CgkJcysrOwoJfQoJKmQgPSAnXDAnOwoJcmV0dXJuIGRsZW4gKyAoc2l6ZV90KShzIC0gc3JjKTsKfQojZW5kaWY=' | base64 -d >> hackios/xnu-deps/hostinc/hostcompat.h
-          tail -6 hackios/xnu-deps/hostinc/hostcompat.h
+          # Ubuntu 22.04 has glibc 2.35; the XNU SETUP tools use strlcat/strlcpy, which glibc only grew
+          # in 2.38 (the developers were on Arch). hostcompat.h is force-included into every host tool.
+          echo 'Ci8qIGdsaWJjIG9ubHkgZ3JldyBzdHJsY3B5L3N0cmxjYXQgaW4gMi4zODsgdGhlIFhOVSBTRVRVUCB0b29scyB1c2UgYm90aC4gKi8KI2lmIGRlZmluZWQoX19saW51eF9fKSAmJiBkZWZpbmVkKF9fR0xJQkNfXykgJiYgKF9fR0xJQkNfXyA9PSAyICYmIF9fR0xJQkNfTUlOT1JfXyA8IDM4KQpzdGF0aWMgaW5saW5lIHNpemVfdApzdHJsY3B5KGNoYXIgKmRzdCwgY29uc3QgY2hhciAqc3JjLCBzaXplX3Qgc2l6KQp7CgljaGFyICpkID0gZHN0OwoJY29uc3QgY2hhciAqcyA9IHNyYzsKCXNpemVfdCBuID0gc2l6OwoKCWlmIChuICE9IDApIHsKCQl3aGlsZSAoLS1uICE9IDApIHsKCQkJaWYgKCgqZCsrID0gKnMrKykgPT0gJ1wwJykgewoJCQkJYnJlYWs7CgkJCX0KCQl9Cgl9CglpZiAobiA9PSAwKSB7CgkJaWYgKHNpeiAhPSAwKSB7CgkJCSpkID0gJ1wwJzsKCQl9CgkJd2hpbGUgKCpzKyspIHsKCQkJOwoJCX0KCX0KCXJldHVybiAoc2l6ZV90KShzIC0gc3JjIC0gMSk7Cn0KCnN0YXRpYyBpbmxpbmUgc2l6ZV90CnN0cmxjYXQoY2hhciAqZHN0LCBjb25zdCBjaGFyICpzcmMsIHNpemVfdCBzaXopCnsKCWNoYXIgKmQgPSBkc3Q7Cgljb25zdCBjaGFyICpzID0gc3JjOwoJc2l6ZV90IG4gPSBzaXo7CglzaXplX3QgZGxlbjsKCgl3aGlsZSAobi0tICE9IDAgJiYgKmQgIT0gJ1wwJykgewoJCWQrKzsKCX0KCWRsZW4gPSAoc2l6ZV90KShkIC0gZHN0KTsKCW4gPSBzaXogLSBkbGVuOwoKCWlmIChuID09IDApIHsKCQlyZXR1cm4gZGxlbiArIHN0cmxlbihzKTsKCX0KCXdoaWxlICgqcyAhPSAnXDAnKSB7CgkJaWYgKG4gIT0gMSkgewoJCQkqZCsrID0gKnM7CgkJCW4tLTsKCQl9CgkJcysrOwoJfQoJKmQgPSAnXDAnOwoJcmV0dXJuIGRsZW4gKyAoc2l6ZV90KShzIC0gc3JjKTsKfQojZW5kaWY=' \
+            | base64 -d >> hackios/xnu-deps/hostinc/hostcompat.h
+          tail -3 hackios/xnu-deps/hostinc/hostcompat.h
 
       - name: use the marble touch driver from this repository, if present
         run: |
@@ -65,61 +72,44 @@ jobs:
             echo "marble/redwood_goodix.c not in the repo: building the stock redwood driver"
           fi
 
-      - name: use the theos Apple clang, like the HackiOS developers do
+      - name: teach xnu-clang where clang and ld64 are
         run: |
-          # xnu-clang execs /usr/bin/clang (Ubuntu's LLVM build). A kernel cross-built for XNU's early
-          # boot with a different compiler hangs before its console exists, so point the wrapper at the
-          # Apple clang that comes with the theos toolchain we already downloaded.
-          test -x "$HOME/theos/toolchain/linux/iphone/bin/clang"
-          sed -i 's|exec /usr/bin/\$drv|exec "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/$drv"|' \
-            hackios/xnu-deps/host/bin/xnu-clang
-
-          # that clang is version 11: --ld-path= arrived in clang 12. In clang 11 the linker is picked
-          # with -B<dir> (a directory containing `ld`), so link cctools' ld64 as host/bin/ld and use -B.
+          W=hackios/xnu-deps/host/bin/xnu-clang
+          # 1) the wrapper hardcodes /usr/bin/clang; use the clang 18 we put in /usr/local/bin
+          sed -i 's|exec /usr/bin/\$drv|exec /usr/local/bin/$drv|' "$W"
+          # 2) cctools ld64 as host/bin/ld, found through -B (works on every clang version)
           ln -sf ld64 hackios/xnu-deps/host/bin/ld
-          perl -0pi -e 's|--ld-path="\$HB/ld64"|-B"\$HB"|' hackios/xnu-deps/host/bin/xnu-clang
-          grep -n 'exec\|-B' hackios/xnu-deps/host/bin/xnu-clang
-          ls -l hackios/xnu-deps/host/bin/ld
-          "$HOME/theos/toolchain/linux/iphone/bin/clang" --version | head -2
-
-      - name: teach xnu-clang the flags of a newer clang
-        run: |
-          # theos' toolchain is clang 11; XNU 8796 is written for Apple clang 15. The wrapper drops
-          # arguments the compiler would refuse, so extend its list with the ones clang 11 lacks:
-          #   -ftrivial-auto-var-init=*     clang 12 (needs an opt-in flag as well)
-          #   -fsanitize-ignorelist=*       clang 12 (was -fsanitize-blacklist=*)
-          #   -fsanitize-blacklist=*        the old name, harmless to drop too
-          #   -moutline-atomics             clang 12
-          #   -fno-experimental-...         several were renamed around clang 12
-          perl -0pi -e 's/\Q    -fapple-kext-vtable-verify\E/    -ftrivial-auto-var-init=*|-fsanitize-ignorelist=*|-fsanitize-blacklist=*|-moutline-atomics|-fno-outline-atomics|-fapple-kext-vtable-verify/' \
-            hackios/xnu-deps/host/bin/xnu-clang
-          grep -n 'ftrivial-auto-var-init' hackios/xnu-deps/host/bin/xnu-clang
+          perl -0pi -e 's|--ld-path="\$HB/ld64"|-B"\$HB"|' "$W"
+          # 3) flags clang refuses: dropped, like the wrapper already does for other Apple-only ones
+          perl -0pi -e 's/\Q    -fapple-kext-vtable-verify\E/    -ftrivial-auto-var-init=*|-fsanitize-ignorelist=*|-fsanitize-blacklist=*|-moutline-atomics|-fno-outline-atomics|-fapple-kext-vtable-verify/' "$W"
+          grep -n 'exec\|-B\|ftrivial' "$W" | head
 
       - name: apply the XNU patches and build
         run: |
           cd hackios
           xnu/apply.sh
           if ! xnu-deps/setup.sh; then
-            echo "===== setup failed: every error-ish line of exporthdrs.log ====="
+            echo "===== setup failed: error-ish lines of exporthdrs.log ====="
             grep -niE 'error|fatal|cannot find|undefined reference|no such file' \
               xnu-deps/exporthdrs.log 2>/dev/null | tail -40 || true
             echo "===== context around the first error ====="
             grep -niE -B8 -A12 'error|fatal|cannot find|undefined reference|no such file' \
               xnu-deps/exporthdrs.log 2>/dev/null | head -160 || true
-            echo "===== last 60 lines of exporthdrs.log ====="
-            tail -60 xnu-deps/exporthdrs.log 2>/dev/null || echo "(no exporthdrs.log)"
             exit 1
           fi
-          # the export check after linking is expected to fail (xnu/README.md); judge by the file
+          # xnu/README.md: the build always ends with the check_all_exports error; the kernel is linked
+          # and usable by then, so judge by the file, not by make's exit status.
           ./xnu-build.sh -j"$(nproc)" -k || true
           K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
           if [ ! -s "$K" ]; then
             echo "===== no kernel; last 80 lines of the build log ====="
-            tail -80 xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/*.log 2>/dev/null || true
             tail -80 "$(ls -t xnu-src/xnu-8796.121.2/BUILD/*.log 2>/dev/null | head -1)" 2>/dev/null || true
             exit 1
           fi
           ls -l "$K"
+          # the developers compared size with the working kernel (15623056 bytes); a big difference
+          # means a different compiler or a broken link
+          echo "size: $(stat -c %s "$K") (the working redwood kernel is 15623056)"
 
       - uses: actions/upload-artifact@v4
         with:
