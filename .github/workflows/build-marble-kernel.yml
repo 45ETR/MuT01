@@ -82,13 +82,18 @@ jobs:
           ls -l hackios/xnu-deps/host/bin/ld
           "$HOME/theos/toolchain/linux/iphone/bin/clang" --version | head -2
 
-      - name: let the build pass with any clang (drops Apple-only flags)
+      - name: teach xnu-clang the flags of a newer clang
         run: |
-          # XNU passes -ftrivial-auto-var-init=zero, which only Apple's clang accepts silently; keeping
-          # the wrapper's drop-list means the build works whichever clang ends up behind it.
-          perl -0pi -e 's/    -fapple-kext-vtable-verify/    -ftrivial-auto-var-init=*|-fapple-kext-vtable-verify/' \
+          # theos' toolchain is clang 11; XNU 8796 is written for Apple clang 15. The wrapper drops
+          # arguments the compiler would refuse, so extend its list with the ones clang 11 lacks:
+          #   -ftrivial-auto-var-init=*     clang 12 (needs an opt-in flag as well)
+          #   -fsanitize-ignorelist=*       clang 12 (was -fsanitize-blacklist=*)
+          #   -fsanitize-blacklist=*        the old name, harmless to drop too
+          #   -moutline-atomics             clang 12
+          #   -fno-experimental-...         several were renamed around clang 12
+          perl -0pi -e 's/\Q    -fapple-kext-vtable-verify\E/    -ftrivial-auto-var-init=*|-fsanitize-ignorelist=*|-fsanitize-blacklist=*|-moutline-atomics|-fno-outline-atomics|-fapple-kext-vtable-verify/' \
             hackios/xnu-deps/host/bin/xnu-clang
-          grep -n 'trivial-auto-var-init' hackios/xnu-deps/host/bin/xnu-clang
+          grep -n 'ftrivial-auto-var-init' hackios/xnu-deps/host/bin/xnu-clang
 
       - name: apply the XNU patches and build
         run: |
