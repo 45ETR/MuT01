@@ -135,12 +135,19 @@ jobs:
         run: |
           # where the packages need to be visible from: the directory that CONTAINS UniXNUPkg, and the
           # one that contains DarwinBootPkg
+          # the directory that CONTAINS UniXNUPkg (or the package root itself)
           if [ -d UniXNU/package/UniXNUPkg ]; then PKGROOT=$PWD/UniXNU/package; else PKGROOT=$PWD/UniXNU; fi
-          DBPKG=$(dirname "$(find UniXNU/drivers/DarwinBoot -name DarwinBoot.inf | head -1)")
-          DBPKG=${DBPKG%/Driver}
-          echo "PKGROOT=$PKGROOT"; echo "DBPKG=$DBPKG"
-          test -d "$PKGROOT/UniXNUPkg" ; test -d "$DBPKG/DarwinBootPkg"
-          echo "PACKAGES_PATH=$PKGROOT:$DBPKG:$PWD/Mu-Silicium" >> "$GITHUB_ENV"
+          # DarwinBoot.inf sits at <...>/DarwinBootPkg/Driver/DarwinBoot.inf: PACKAGES_PATH needs the
+          # directory that contains DarwinBootPkg, i.e. the repo checkout, not the package directory
+          DBINF=$(find "$PWD/UniXNU/drivers/DarwinBoot" -name DarwinBoot.inf | head -1)
+          echo "DarwinBoot.inf: $DBINF"
+          DBPKG=$(cd "$(dirname "$DBINF")/.." && pwd)          # .../DarwinBootPkg
+          DBPARENT=$(dirname "$DBPKG")                         # .../drivers/DarwinBoot
+          echo "PKGROOT=$PKGROOT"; echo "DBPKG=$DBPKG"; echo "DBPARENT=$DBPARENT"
+          test -d "$PKGROOT/UniXNUPkg"
+          test -d "$DBPKG"
+          test -d "$DBPKG/Driver"
+          echo "PACKAGES_PATH=$PKGROOT:$DBPARENT:$PWD/Mu-Silicium" >> "$GITHUB_ENV"
 
           python3 -m venv --clear venv
           venv/bin/python -c "import tomllib"
