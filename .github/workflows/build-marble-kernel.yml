@@ -1,4 +1,4 @@
-# Build the marble XNU kernel on GitHub's runners, so the 200 MB Linux toolchain never crosses your link.
+﻿# Build the marble XNU kernel on GitHub's runners, so the 200 MB Linux toolchain never crosses your link.
 #
 # What it does:
 #   - installs theos + the prebuilt Linux iOS toolchain + iPhoneOS16.5.sdk (all at runner speed)
@@ -46,6 +46,15 @@ jobs:
 
       - name: hackios source
         run: git clone --depth 1 https://github.com/oosexgang/hackios-xnu-kernel.git hackios
+
+      - name: glibc < 2.38 needs strlcat/strlcpy for the host tools
+        run: |
+          # hackios was developed on Arch (glibc >= 2.38, which has strlcat/strlcpy in libc).
+          # Ubuntu 22.04 has glibc 2.35, so SETUP/replacecontents fails to link with
+          # "undefined reference to strlcat". hostcompat.h is force-included into every host tool.
+          # The snippet is base64 so no line of C can break this YAML block scalar.
+          echo 'Ci8qIGdsaWJjIG9ubHkgZ3JldyBzdHJsY3B5L3N0cmxjYXQgaW4gMi4zODsgdGhlIFhOVSBTRVRVUCB0b29scyB1c2UgYm90aC4gKi8KI2lmIGRlZmluZWQoX19saW51eF9fKSAmJiBkZWZpbmVkKF9fR0xJQkNfXykgJiYgKF9fR0xJQkNfXyA9PSAyICYmIF9fR0xJQkNfTUlOT1JfXyA8IDM4KQpzdGF0aWMgaW5saW5lIHNpemVfdApzdHJsY3B5KGNoYXIgKmRzdCwgY29uc3QgY2hhciAqc3JjLCBzaXplX3Qgc2l6KQp7CgljaGFyICpkID0gZHN0OwoJY29uc3QgY2hhciAqcyA9IHNyYzsKCXNpemVfdCBuID0gc2l6OwoKCWlmIChuICE9IDApIHsKCQl3aGlsZSAoLS1uICE9IDApIHsKCQkJaWYgKCgqZCsrID0gKnMrKykgPT0gJ1wwJykgewoJCQkJYnJlYWs7CgkJCX0KCQl9Cgl9CglpZiAobiA9PSAwKSB7CgkJaWYgKHNpeiAhPSAwKSB7CgkJCSpkID0gJ1wwJzsKCQl9CgkJd2hpbGUgKCpzKyspIHsKCQkJOwoJCX0KCX0KCXJldHVybiAoc2l6ZV90KShzIC0gc3JjIC0gMSk7Cn0KCnN0YXRpYyBpbmxpbmUgc2l6ZV90CnN0cmxjYXQoY2hhciAqZHN0LCBjb25zdCBjaGFyICpzcmMsIHNpemVfdCBzaXopCnsKCWNoYXIgKmQgPSBkc3Q7Cgljb25zdCBjaGFyICpzID0gc3JjOwoJc2l6ZV90IG4gPSBzaXo7CglzaXplX3QgZGxlbjsKCgl3aGlsZSAobi0tICE9IDAgJiYgKmQgIT0gJ1wwJykgewoJCWQrKzsKCX0KCWRsZW4gPSAoc2l6ZV90KShkIC0gZHN0KTsKCW4gPSBzaXogLSBkbGVuOwoKCWlmIChuID09IDApIHsKCQlyZXR1cm4gZGxlbiArIHN0cmxlbihzKTsKCX0KCXdoaWxlICgqcyAhPSAnXDAnKSB7CgkJaWYgKG4gIT0gMSkgewoJCQkqZCsrID0gKnM7CgkJCW4tLTsKCQl9CgkJcysrOwoJfQoJKmQgPSAnXDAnOwoJcmV0dXJuIGRsZW4gKyAoc2l6ZV90KShzIC0gc3JjKTsKfQojZW5kaWY=' | base64 -d >> hackios/xnu-deps/hostinc/hostcompat.h
+          tail -6 hackios/xnu-deps/hostinc/hostcompat.h
 
       - name: use the marble touch driver from this repository, if present
         run: |
