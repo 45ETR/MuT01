@@ -1,116 +1,178 @@
-# Build UniXNU's UEFI packages (UniXNU.efi, UniXNUDxe, DarwinBoot ...) for marble on GitHub runners.
+# Build the marble UEFI with UniXNU's boot manager, so the phone can run the UniXNU flow instead of
+# HackiOS's loader.
 #
-# Why CI: `./unixnu build package` fetches mu_basecore, Mu, edk2 and the component submodules; from
-# some networks that takes hours, while the runner reaches GitHub directly.
-#
-# The marble device repository and the sm7475 SoC repository are embedded in this file as base64 and
-# written out before the build, so uploading this single workflow is enough.
-#
-# What it does:
-#   1. clones UniXNU with its component submodules
-#   2. writes unixnu/UniXNU-marble and unixnu/UniXNU-sm7475-common, makes them git repositories and
-#      points the SoC feed at the local checkout with a file:// URL
-#   3. ./unixnu defconfig marble_defconfig -D ../UniXNU-marble
-#   4. ./unixnu tree && ./unixnu build package
-#   5. uploads every .efi and .a it produced
-name: build-unixnu-package
+# Same base as build-marble-uefi.yml (the HackiOS-patched marblePkg that already produces a working
+# 3 MiB FD), plus the four packages UniXNUPkg/DarwinBoot need:
+#   DSC [Components]     UniXNU.inf, UniXNUDxe.inf, UniXNURamDiskDxe.inf, DarwinBoot.inf
+#   DSC [LibraryClasses] UniXNULib, FdtLib
+#   FDF [FV.FvMain]      the same four INFs
+#   PACKAGES_PATH        the UniXNU checkout's package/ and drivers/DarwinBoot/
+name: build-unixnu-firmware
 
 on:
   workflow_dispatch:
+    inputs:
+      fd_base:
+        description: 'FD_BASE (marble: 0xA7100000)'
+        default: '0xA7100000'
+      fd_size:
+        description: 'FD_SIZE (marble: 0x300000)'
+        default: '0x300000'
+      payload_base:
+        description: 'PAYLOAD_BASE (64 KiB aligned)'
+        default: '0xAA000000'
 
 jobs:
-  package:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 300
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      FD_BASE: ${{ github.event.inputs.fd_base }}
+      FD_SIZE: ${{ github.event.inputs.fd_size }}
+      PAYLOAD_BASE: ${{ github.event.inputs.payload_base }}
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
-      - name: python 3.12 provides tomllib (Ubuntu 22.04 ships 3.10)
-        run: |
-          python3 --version
-          python3 -c "import tomllib; print('tomllib ok')"
-      - name: host dependencies
+      - name: packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential git curl ca-certificates python3 python3-venv python3-pip \
-            nasm acpica-tools uuid-dev zlib1g-dev libssl-dev pkg-config \
-            clang lld llvm
+            build-essential uuid-dev iasl nasm acpica-tools llvm \
+            python3 python3-venv python3-pip python3-dev \
+            gcc-aarch64-linux-gnu
 
-      - name: UniXNU, with its component submodules
-        run: |
-          git clone --recurse-submodules --depth 1 https://github.com/UniXNU/UniXNU.git unixnu/UniXNU
-          git -C unixnu/UniXNU submodule status | head -30
-      - name: write the marble device and sm7475 SoC repositories
-        run: |
-          # The files are embedded here (base64) so the job needs nothing from this repository.
-          # After the port stabilises they belong in their own repositories and feeds.toml should
-          # point at them instead.
-          mkdir -p unixnu/UniXNU-marble
-          printf '%s' 'IyBVbmlYTlUtbWFyYmxlIC8gYm9hcmQudG9tbCDigJQgRFJBRlQKIwojIOeFp+edgCBVbmlYTlUtc2hlbmcvYm9hcmQudG9tbCDnmoTnu5PmnoTlhpnvvIxtYXJibGXvvIhSZWRtaSBOb3RlIDEyIFR1cmJvLCBTTTc0NzXvvInnmoTlgLzjgIIKIyDmoIcgVE9ETyDnmoTlnLDmlrnlv4XpobvnlKjnnJ/mnLov5Zu65Lu25pWw5o2u5pu/5o2i77yM5qCHIEdVRVNTIOeahOWcsOaWueaYr+eFp+aKhCBzbTg1NTAg55qE44CB6ZyA6KaB6aqM6K+B44CCCiMKIyDov5nkuKrmlofku7bmlL7lnKggPHJlcG8+L2JvYXJkLnRvbWzvvIjorr7lpIfku5PlupPmoLnnm67lvZXvvInvvIzphY3lkIjvvJoKIyAgIGNvbmZpZ3MvbWFyYmxlX2RlZmNvbmZpZyAgIOKAlOKAlCBrZXJuZWwuZGVmY29uZmlnIOaMh+WQkeWugwojICAgZHRzL21hcmJsZS5kdHMgICAgICAgICAgICAg4oCU4oCUIGRldmljZV90cmVlLnNvdXJjZSDmjIflkJHlroMKIyAgIGZlZWRzLnRvbWwgICAgICAgICAgICAgICAgIOKAlOKAlCDmjIflkJEgVW5pWE5VLXNtNzQ3NS1jb21tb24KClsiYm9hcmQiXQoibmFtZSIgPSAibWFyYmxlIgoic29jIiA9ICJTTTc0NzUiCiJkZXNjcmlwdGlvbiIgPSAiUmVkbWkgTm90ZSAxMiBUdXJibyAvIFBPQ08gRjUiCiJraXQiID0gIm1hcmJsZSIKInNvY19zb3VyY2UiID0gInNtNzQ3NSIKIm9zX3Byb2ZpbGUiID0gImlwYWRvcy0xNy43LjExLTIxSDQ2MSIgICAgICAjIEdVRVNTOiDkuI4gc2hlbmcg5ZCMIHByb2ZpbGXvvIzlhYjlpI3nlKgKCiMgVE9ETzogbWFyYmxlIOeahCB1c2VyZGF0YSDliIbljLrlh6DkvZXvvIjljp/ljoIgR1BUIOmHjCB1c2VyZGF0YSDnmoQgZmlyc3RfbGJhL2xhc3RfbGJh77yJCiMg5Y+W5rOV77yaZmFzdGJvb3QgZ2V0dmFyIGFsbCAvIOaJi+acuuS4iueahCBgc2dkaXNrIC1wIC9kZXYvYmxvY2svc2RhYO+8jOaIluWOn+WOgiBzdXBlciDliIbljLrluIPlsYAKWyJ1c2VyZGF0YSJdCiJmaXJzdF9sYmEiID0gMAoibGFzdF9sYmEiID0gMAoibGJhX2J5dGVzIiA9IDQwOTYKIndpbmRvd3MiID0gW3sgIm5hbWUiID0gIk9TIiwgImNvbXBvbmVudCIgPSAiT1MiIH0sIHsgIm5hbWUiID0gIlN5c3RlbU9TIiwgImNvbXBvbmVudCIgPSAiQ3J5cHRleDEsU3lzdGVtT1MiIH1dCgpbImtlcm5lbCJdCiJkZWZjb25maWciID0gIm1hcmJsZV9kZWZjb25maWciCiMg5b2S5qGj5YiX6KGo54WnIHNoZW5nIOeahOmqqOaetuijgeaOiSBTaGVuZyog57uE5Lu277ybbWFyYmxlIOeahCBVRlMv6Kem5pG4L0dQVSDnu4Tku7bov5jmsqHmnIkKImFyY2hpdmVzIiA9IFsKICAiYnVpbGQtY29yZWNyeXB0by0xNC5weSIsCiAgImJ1aWxkLWNvcmVjcnlwdG8tMTQucHkgLS1uYW1lc3BhY2UiLAogICJjb21wb25lbnQ6QXJtRFRQbGF0Zm9ybSIsCiAgImNvbXBvbmVudDpBcm1DcHUiLAogICJjb21wb25lbnQ6U29mdHdhcmVBRVMiLAogICJidWlsZC1zb2Z0d2FyZS1hZXMtYmluZGluZ3MucHkiLAogICJjb21wb25lbnQ6VmlydGlvTW1pb0Jsb2NrIiwKICAiY29tcG9uZW50OlJhbUJsb2NrIiwKICAiYnVpbGQtdmlydGlvLW1taW8tYmluZGluZ3MucHkgLS1jb21wb25lbnQgUmFtQmxvY2sgLS1kaXJlY3RvcnkgYnVpbGQvcmFtLWJsb2NrIiwKICAiYnVpbGQtdmlydGlvLW1taW8tYmluZGluZ3MucHkgLS1jb21wb25lbnQgVmlydGlvTW1pb0Jsb2NrIiwKICAiYnVpbGQtbW9ja2ZzLWZpeHR1cmUucHkiLAogICJidWlsZC1saWJwdGhyZWFkLWtlcm5lbC5weSIsCiAgImNvbXBvbmVudDpBcHBsZUtleVN0b3JlU3RhdGUiLAogICMgVE9ETzog5LiL6Z2i5LiJ5Liq562JIG1hcmJsZSDnu4Tku7blhpnlpb3lkI7lkK/nlKgKICAjICJjb21wb25lbnQ6TWFyYmxlVWZzIiwKICAjICJjb21wb25lbnQ6TWFyYmxlSGlkSW5wdXQiLAogICMgImJ1aWxkLWdvcC1sZWdhY3ktZGlzcGxheS5weSIsCl0KImNvbmZpZ19mcmFnbWVudHMiID0gWyJhcmNoOmNvbmZpZ3MvY29tbW9uLmNvbmZpZyIsICJzb2M6Y29uZmlncy9zbTc0NzUuY29uZmlnIiwgIm9zOmNvbmZpZ3MvaXBhZG9zLmNvbmZpZyJdCiJwYXRjaF9zZXJpZXMiID0gWyJhcmNoOnBhdGNoZXMveG51L3NlcmllcyIsICJzb2M6cGF0Y2hlcy94bnUvc2VyaWVzIiwgIm9zOnBhdGNoZXMveG51L3NlcmllcyIsICJkZXZpY2U6cGF0Y2hlcy94bnUvc2VyaWVzIl0KClsiZmlybXdhcmUiXQoiY29uZmlnIiA9ICJtYXJibGUiCiJkc2MiID0gIlBsYXRmb3Jtcy9YaWFvbWkvbWFyYmxlUGtnL21hcmJsZS5kc2MiCiJmZCIgPSAiQnVpbGQvbWFyYmxlUGtnL3t0YXJnZXR9X0NMQU5HUERCL0ZWL1NJTElDSVVNX1VFRkkuZmQiCiJwcmVmbGlnaHQiID0gW10gICAgICAgICAgICAgICAgICAgICAgICAgICAgIyBUT0RPOiDlhpkgc2NyaXB0cy9jaGVjay1tYXJibGUucHnvvIjmo4Dmn6Xlm7rku7bniYjmnKzjgIHliIbljLrvvIkKInN1Ym1vZHVsZXMiID0gWyJDb21tb24vTXUiLCAiQ29tbW9uL011X09FTV9TYW1wbGUiLCAiU2lsaWNpdW0tQUNQSSIsICJTaWxpY29uL1NpbGljaXVtL09wZW5zc2xQa2cvTGlicmFyeS9PcGVuc3NsTGliL29wZW5zc2wiXQoicGF0Y2hlcyIgPSBbIlJlc291cmNlcy9NdVBhdGNoZXMvR2ljLVNwdXJpb3VzLnBhdGNoIl0KInBhY2thZ2VzIiA9IFsKICAie3VlZml9IiwgInt1ZWZpfS9QbGF0Zm9ybXMvWGlhb21pIiwgInt0cmVlfS9wYWNrYWdlIiwgInt0cmVlfS9kcml2ZXJzL0RhcndpbkJvb3QiLAogICJ7ZWRrMn0iLCAie3VlZml9L0NvbW1vbi9NdSIsICJ7dWVmaX0vQ29tbW9uL011X09FTV9TYW1wbGUiLAogICJ7dWVmaX0vU2lsaWNvbi9RdWFsY29tbSIsICJ7dWVmaX0vU2lsaWNvbi9TaWxpY2l1bSIsICJ7dWVmaX0vU2lsaWNpdW0tQUNQSSIsCiAgInt1ZWZpfS9TaWxpY2l1bS1BQ1BJL1BsYXRmb3Jtcy9YaWFvbWkiLCAie3VlZml9L1NpbGljaXVtLUFDUEkvU2lsaWNvbi9RdWFsY29tbSIsCl0KClsiZmlybXdhcmUiLiJkZWZpbmVzIl0KIkVOQUJMRV9TRUNVUkVCT09UIiA9ICIxIgoiREVWSUNFX01PREVMIiA9ICJtYXJibGUiCiJNRU1PUllfUFJPVEVDVElPTiIgPSAiVFJVRSIKIlNISVBfTU9ERSIgPSAiRkFMU0UiCiJCVUlMRElEX1NUUklORyIgPSAibWFyYmxlLXJlc2VhcmNoIgoKWyJwYXlsb2FkIl0KInZvbHVtZSIgPSAiTUFSQkxFRVNQIgoic2l6ZV9taWIiID0gMjA4CiJsb2FkZXIiID0gImZpcm13YXJlIgoidGl0bGUiID0gIkJvb3QiCiJkcmFtX3NpemUiID0gIjB4ODAwMDAwMDAiICAgICAgICAgICAgICAgICAgIyBHVUVTUzog54WnIHNoZW5n77yb6ZyA56Gu6K6kIHBheWxvYWQg5Y235Y+v55So55qE56qX5Y+jCiJza2lwX3NldHVwX3Rvb2wiID0gInNjcmlwdHMvc2VlZC1kYXRhLXNraXAtc2V0dXAucHkiCiJwYW5pY19zY3JlZW4iID0gdHJ1ZQojIG1hcmJsZSDniYjnmoTlvIDlhbPvvJrlhYjlj6rkv53nlZnkuI4gU29DIOaXoOWFs+eahO+8jG1hcmJsZS0qIOWJjee8gOeahOetiempseWKqOiHquW3seWumuS5iQoia2VybmVsX2FyZ3MiID0gWwogICItdiIsICJzZXJpYWw9MyIsICJkZWJ1Zz0weDE0ZSIsCiAgIi1ub19zbHRvX3BhbmljIiwKICAibWwtdGltZW91dC1sb2NrLXBhbmljLXNjYWxlPTQwIiwKICAiYm9vdC1wcm9ncmVzcz0yIiwKICAibmF0aXZlLXVmcy1yb290PTEiLAogICJhcm1jcHUtc3BpLWlwaT0xIiwKICAib2ZmbGluZS1sZWdhY3ktcmVnaXN0ZXI9MSIsCiAgIm9mZmxpbmUtbGVnYWN5LWdvcD0xIiwKICAib2ZmbGluZS1sZWdhY3ktdW5pdC1zY2FsZT0yIiwKICAib2ZmbGluZS1sZWdhY3ktcG09MSIsCiAgIm9mZmxpbmUtbGVnYWN5LXZhbGlkYXRlPTEiLAogICJvZmZsaW5lLWxlZ2FjeS10cmFuc2Zlcj0xIiwKICAib2ZmbGluZS1sZWdhY3ktY3B1LXByZXNlbnQ9MSIsCiAgIyBUT0RPOiBtYXJibGUtKiDpqbHliqjlvIDlhbPvvIjop6bmkbjjgIHog4zlhYnjgIFHUFXjgIHnlLXmupDvvInnrYnnu4Tku7blsLHkvY3lkI7ooaUKXQoKWyJwYXlsb2FkIi4iaW5zdGFsbCJdCiJ0aXRsZSIgPSAiSW5zdGFsbCBhbmQgYm9vdCIKImNvbmZpcm0iID0gIkVSQVNFIGFsbCBpUGFkT1MgdXNlciBkYXRhIGFuZCBpbnN0YWxsIGFnYWluPyIKImNvbmZpcm1fdGl0bGVzIiA9IFsiRXJhc2UgRGF0YSwgc2tpcCBIZWxsbywgYm9vdCIsICJFcmFzZSBEYXRhLCBzaG93IEhlbGxvLCBib290Il0KImNvbmZpcm1fYXJncyIgPSBbIm1hcmJsZS1kYXRhLXJlc2V0PTEiLCAibWFyYmxlLWRhdGEtcmVzZXQ9MiJdCgpbInBheWxvYWQiLiJhZHQiXQoiY2hpcF9pZCIgPSAiMCIgICAgICAgICAgICAgICAgICAgICAgICAgICAgICMgVE9ETzogbWFyYmxlIOeahCBBcHBsZSDpo47moLwgY2hpcCBpZO+8iHNoZW5nIOaYryAyMDfvvIkKIm93bmVkX21lbW9yeV9zaXplIiA9ICIweDQwMDAwMDAwMCIgICAgICAgICAjIFRPRE86IOS+neacuuWeiyBSQU3vvIgxNiBHQiDniYjnuqYgMHg0MDAwMDAwMDDvvIkKInJvb3RfbWF0Y2hfdm9sdW1lX3V1aWQiID0gIjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCIgICAjIFRPRE86IOW7uuWlvSB1c2VyZGF0YSDlkI7loasKInBhY2tlZF9kYXRhX3JhbWRpc2siID0gdHJ1ZQoicGVyc2lzdGVudF9kYXRhIiA9IHRydWUKInVuaXF1ZV9jaGlwX2lkIiA9ICJyZXF1aXJlZCIKCiMg5ZKMIHNoZW5nIOS4gOagt++8muaKiiBzcGxhc2hfcmVnaW9uIOaMh+WQkSBVRUZJIOeUqOeahCBmcmFtZWJ1ZmZlciDljLrln5/jgIIKIyBtYXJibGUg55qEIERpc3BsYXkgUmVzZXJ2ZWQg5q2j5aW95Lmf5pivIDB4QjgwMDAwMDAgKyAweDAyQjAwMDAw77yI5oiR5Lus5a6e5rWLIEZCX0JBU0U9MHhCODAwMDAwMO+8ieOAggpbImJvb3RpbWciXQojIFRPTUwg55qE5YaF6IGU6KGo5b+F6aG75YaZ5Zyo5LiA6KGM6YeM77yIc2hlbmcg6YKj5Lu95Lmf5piv5Y2V6KGM77yJCiJkdGJfbm9kZSIgPSBbeyAicGF0aCIgPSAiL3Jlc2VydmVkLW1lbW9yeS9zcGxhc2hfcmVnaW9uIiwgInByb3BzIiA9IFt7ICJuYW1lIiA9ICJsYWJlbCIsICJ0eXBlIiA9ICJzIiwgInZhbHVlIiA9ICJjb250X3NwbGFzaF9yZWdpb24iIH0sIHsgIm5hbWUiID0gInJlZyIsICJ0eXBlIiA9ICJ4IiwgInZhbHVlIiA9IFsiMHgwIiwgIjB4YjgwMDAwMDAiLCAiMHgwIiwgIjB4MmIwMDAwMCJdIH1dIH1dCgpbImRldmljZV90cmVlIl0KInNvdXJjZSIgPSAiZGV2aWNlOmR0cy9tYXJibGUuZHRzIgoiaW5jbHVkZV9kaXJzIiA9IFsic29jOmR0cyJdCgpbImNvbXBvbmVudHMiXQojIOWFiOWPquaUvuS4jiBTb0Mg5peg5YWz44CB5LiU5bey5ZyoIFVuaVhOVSDph4zlrZjlnKjnmoTnu4Tku7bvvJttYXJibGUg5LiT5bGe55qE562J5YaZ5aW95ZCO5pu/5o2iCiJpbmNsdWRlIiA9IFsKICAiQXJtRFRQbGF0Zm9ybSIsICJBcm1DcHUiLCAiU29mdHdhcmVBRVMiLAogICJWaXJ0aW9NbWlvQmxvY2siLCAiUmFtQmxvY2siLAogICJBcHBsZUtleVN0b3JlU3RhdGUiLCAiR29wRnJhbWVidWZmZXIiLAogICJYbnVQcmVsaW5rIiwgIkRhcndpbkJvb3QiLCAiVmVyaWZpZWRSb290IiwKICAjIFRPRE86ICJNYXJibGVVZnMiLCAiTWFyYmxlSGlkSW5wdXQiLCAiTWFyYmxlVG91Y2giLCAiTWFyYmxlRGlzcGxheSIsCiAgIyBUT0RPOiAiQWRyZW5vNzI1Iu+8iOaIluaUuSBBZHJlbm83NDAg55qEIFNLVSDlj4LmlbDvvIksICJBdGgxMmtXaWZpIgpdCgpbImFkdCJdCgpbImFkdCIuInByb2R1Y3QiXQoKWyJhZHQiLiJwcm9kdWN0Ii4ic3RyaW5nIl0KIm1vZGVsIiA9ICJ4aWFvbWksbWFyYmxlIgoiYXJ0d29yay1kaXNwbGF5LWdhbXV0IiA9ICJzUkdCIgoKWyJhZHQiLiJwcm9kdWN0Ii4idTMyIl0KInRoaW4tYmV6ZWwiID0gMQo=' | base64 -d > unixnu/UniXNU-marble/board.toml
-          printf '%s' 'IyBVbmlYTlUtbWFyYmxlIC8gZmVlZHMudG9tbCDigJQgRFJBRlQKIwojIFBvaW50cyB0aGUgZGV2aWNlIGF0IGl0cyBTb0MgcmVwb3NpdG9yeS4gUmVwbGFjZSA8eW91PiBhbmQgdGhlIGNvbW1pdCBvbmNlIHRoZSBTb0MgcmVwbyBleGlzdHMuCiMgRm9yIGEgZmlyc3QgbG9jYWwgdGVzdCB5b3UgY2FuIHBvaW50IGBnaXRgIGF0IGEgcGF0aCBvbiBkaXNrIGFuZCBvbWl0IGBjb21taXRgLCBidXQgcGlubmluZyBpcyB3aGF0CiMgYC4vdW5peG51IGZldGNoYCByZWNvcmRzIGluIHVuaXhudS5sb2NrLCBzbyBmaWxsIGl0IGluIGJlZm9yZSBwdWJsaXNoaW5nLgoKW1tzb3VyY2VdXQpraW5kID0gInNvYyIKbmFtZSA9ICJzbTc0NzUiCmdpdCA9ICJodHRwczovL2dpdGh1Yi5jb20vPHlvdT4vVW5pWE5VLXNtNzQ3NS1jb21tb24uZ2l0Igpjb21taXQgPSAiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIK' | base64 -d > unixnu/UniXNU-marble/feeds.toml
-          mkdir -p unixnu/UniXNU-marble/configs
-          printf '%s' 'IyBVbmlYTlUtbWFyYmxlIC8gY29uZmlncy9tYXJibGVfZGVmY29uZmlnIOKAlCBEUkFGVAojCiMgS2NvbmZpZyBmcmFnbWVudCBzZWxlY3RlZCBieSBib2FyZC50b21sIGBba2VybmVsXSBkZWZjb25maWcgPSAibWFyYmxlX2RlZmNvbmZpZyJgLgojIERlcml2ZWQgZnJvbSBVbmlYTlUtc2hlbmcvY29uZmlncy9zaGVuZ19kZWZjb25maWcgd2l0aCB0aGUgc2hlbmctb25seSBzd2l0Y2hlcyByZW1vdmVkLgojIE5PVEU6IHRoZSBwYXJzZXIgYWNjZXB0cyBubyB0cmFpbGluZyBjb21tZW50IG9uIGEgdmFsdWUgbGluZSwgc28gZXZlcnkgbm90ZSBsaXZlcyBvbiBpdHMgb3duIGxpbmUuCgojIC0tLSBidWlsZCAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KQ09ORklHX1hOVV9CVUlMRF9BUkNISVZFUz15CgojIC0tLSBzdG9yYWdlIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KQ09ORklHX1hOVV9OQVRJVkVfVUZTPXkKQ09ORklHX1hOVV9OQVRJVkVfVklSVElPX0JMT0NLPXkKQ09ORklHX1hOVV9OQVRJVkVfUkFNX0JMT0NLPXkKCiMgLS0tIGJvb3QgcG9saWN5IC8gcm9vdCAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpDT05GSUdfWE5VX1ZFUklGSUVEX1JPT1RfUFJPQkU9eQpDT05GSUdfWE5VX09XTkVSX1JPT1RfQVVESVQ9eQpDT05GSUdfWE5VX09XTkVSX1JPT1RfVFJVU1Q9eQpDT05GSUdfWE5VX09XTkVSX0NBQ0hFX01PVU5UPXkKQ09ORklHX1hOVV9PV05FUl9DQUNIRV9TVEFSVFVQPXkKQ09ORklHX1hOVV9PV05FUl9CT09UX01BTklGRVNUPXkKQ09ORklHX1hOVV9PV05FUl9EQVRBX01PVU5UPXkKQ09ORklHX1hOVV9PV05FUl9VTklPTl9TWVNURU1PUz15CgojIFRPRE86IHJlcGxhY2Ugd2l0aCB0aGUgVVVJRCBvZiB0aGUgRGF0YSB2b2x1bWUgYWZ0ZXIgYC4vdW5peG51IGJ1aWxkIHVzZXJkYXRhYApDT05GSUdfWE5VX09XTkVSX0RBVEFfVk9MVU1FX1VVSUQ9IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCIKCiMgLS0tIGRpc3BsYXkgLyBpbnB1dCAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpDT05GSUdfWE5VX05BVElWRV9MRUdBQ1lfRElTUExBWT15CgojIFRPRE86IDEgb25jZSBhIHJlYWwgZGlzcGxheSBkcml2ZXIgZXhpc3RzCkNPTkZJR19YTlVfTkFUSVZFX01PQklMRV9ESVNQTEFZPW4KCkNPTkZJR19YTlVfRFRfUEFOSUNfUkVHSU9OPXkKQ09ORklHX1hOVV9CT09UX1BST0dSRVNTPXkKQ09ORklHX1hOVV9aT05FX1BHWl9BTElHTk1FTlRfUFJPQkU9eQoKIyAtLS0gYXJjaGl2ZXMgKHBhdGhzIGZpbGxlZCBieSB0aGUgcmVjaXBlcykgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCkNPTkZJR19YTlVfTkFUSVZFX1ZJUlRJT19CTE9DS19BUkNISVZFPSJ7dHJlZX0vYnVpbGQvdmlydGlvLW1taW8tYmxvY2stdmVyaWZpZWQtYnVuZGxlL2xpYlZpcnRpb01taW9CbG9jay5hIgpDT05GSUdfWE5VX1ZFUklGSUVEX1JPT1RfQVJDSElWRT0ie3RyZWV9L2J1aWxkL3ZlcmlmaWVkLXJvb3Qtb3MteG51LWJ1bmRsZS9saWJWZXJpZmllZFJvb3RQcm9iZS5hIgpDT05GSUdfWE5VX0VYVFJBX0xEX0FSQ0hJVkVTPSIiCgojIC0tLSBwbGF0Zm9ybSAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KQ09ORklHX1hOVV9BUk1WSVJUX1BMQVRGT1JNPW4KCiMgVE9ETzogb25jZSB0aGUgbWFyYmxlIGRyaXZlcnMgZXhpc3QgYW5kIGRlZmluZSB0aGVzZToKIyBDT05GSUdfWE5VX01BUkJMRV9QTUdSPXkKIyBDT05GSUdfWE5VX01BUkJMRV9UT1VDSD15CiMgQ09ORklHX1hOVV9NQVJCTEVfQkFDS0xJR0hUPXkKIyBDT05GSUdfWE5VX01BUkJMRV9HUFU9eQo=' | base64 -d > unixnu/UniXNU-marble/configs/marble_defconfig
-          mkdir -p unixnu/UniXNU-marble/dts
-          printf '%s' 'Ly8gU1BEWC1MaWNlbnNlLUlkZW50aWZpZXI6IEJTRC0zLUNsYXVzZQovLyBVbmlYTlUtbWFyYmxlIC8gZHRzL21hcmJsZS5kdHMg4oCUIERSQUZUCi8vCi8vIEJvYXJkIGxheWVyOiBtZW1vcnksIHJlc2VydmVkIHJlZ2lvbnMsIGFuZCB3aGljaCBTb0MgcGVyaXBoZXJhbHMgYXJlIGVuYWJsZWQuCi8vIE1pcnJvcnMgVW5pWE5VLXNoZW5nL2R0cy9zaGVuZy5kdHMsIHdpdGggbWFyYmxlJ3MgdmFsdWVzLgoKL2R0cy12MS87CiNpbmNsdWRlICJzbTc0NzUuZHRzaSIKCi8gewogICAgbW9kZWwgPSAiWGlhb21pIFJlZG1pIE5vdGUgMTIgVHVyYm8iOwogICAgY29tcGF0aWJsZSA9ICJ4aWFvbWksbWFyYmxlIiwgInFjb20sc203NDc1IjsKCiAgICAvKiBUT0RPOiB0aGUgc2l6ZSBVbmlYTlUgc2hvdWxkIHNlZS4gc2hlbmcgZGVjbGFyZXMgMiBHaUIgYWx0aG91Z2ggdGhlIHRhYmxldCBoYXMgbW9yZTsKICAgICAqIGJvYXJkLnRvbWwgW3BheWxvYWQuYWR0XSBvd25lZF9tZW1vcnlfc2l6ZSBpcyB0aGUgdmFsdWUgWE5VIGlzIHRvbGQgYWJvdXQgKDE2IEdpQiBib2FyZDoKICAgICAqIDB4NDAwMDAwMDAwKS4gU3RhcnQgd2l0aCAyIEdpQiBsaWtlIHNoZW5nIGFuZCByYWlzZSBpdCBvbmNlIHRoZSBrZXJuZWwgYm9vdHMuICovCiAgICBtZW1vcnlAODAwMDAwMDAgewogICAgICAgIGRldmljZV90eXBlID0gIm1lbW9yeSI7CiAgICAgICAgcmVnID0gPDAgMHg4MDAwMDAwMCAwIDB4ODAwMDAwMDA+OwogICAgfTsKCiAgICByZXNlcnZlZC1tZW1vcnkgewogICAgICAgICNhZGRyZXNzLWNlbGxzID0gPDI+OwogICAgICAgICNzaXplLWNlbGxzID0gPDI+OwogICAgICAgIHJhbmdlczsKCiAgICAgICAgLyogbWFyYmxlOiBEaXNwbGF5IFJlc2VydmVkIDB4QjgwMDAwMDAgKyAweDAyQjAwMDAwIChhbHNvIHRoZSBVRUZJIEdPUCBmcmFtZWJ1ZmZlciB3ZSBzYXcpICovCiAgICAgICAgc3BsYXNoX3JlZ2lvbjogZnJhbWVidWZmZXJAYjgwMDAwMDAgewogICAgICAgICAgICBsYWJlbCA9ICJjb250X3NwbGFzaF9yZWdpb24iOwogICAgICAgICAgICByZWcgPSA8MCAweGI4MDAwMDAwIDAgMHgyYjAwMDAwPjsKICAgICAgICAgICAgbm8tbWFwOwogICAgICAgIH07CiAgICB9Owp9OwoKLyogU3RhcnQgd2l0aCB0aGUgbGl0dGxlIGNsdXN0ZXIgcGx1cyB0aGUgcHJpbWUgY29yZTsgZW5hYmxlIHRoZSByZXN0IG9uY2UgU01QIGlzIHN0YWJsZS4KICogKHNoZW5nIGRpc2FibGVzIHR3byBDUFVzIGZvciB0aGUgc2FtZSByZWFzb24uKSAqLwomY3B1MSB7IHN0YXR1cyA9ICJkaXNhYmxlZCI7IH07CiZjcHUyIHsgc3RhdHVzID0gImRpc2FibGVkIjsgfTsKJmNwdTMgeyBzdGF0dXMgPSAiZGlzYWJsZWQiOyB9OwomY3B1NCB7IHN0YXR1cyA9ICJkaXNhYmxlZCI7IH07CiZjcHU1IHsgc3RhdHVzID0gImRpc2FibGVkIjsgfTsKJmNwdTYgeyBzdGF0dXMgPSAiZGlzYWJsZWQiOyB9OwoKJnVmcyB7IHN0YXR1cyA9ICJva2F5IjsgfTsKJnVmc3BoeSB7IHN0YXR1cyA9ICJva2F5IjsgfTsKJmdwdSB7IHN0YXR1cyA9ICJkaXNhYmxlZCI7IH07ICAgICAgLyogbm8gQWRyZW5vIDcyNSBkcml2ZXIgeWV0ICovCg==' | base64 -d > unixnu/UniXNU-marble/dts/marble.dts
-          mkdir -p unixnu/UniXNU-sm7475-common
-          printf '%s' 'InNjaGVtYV92ZXJzaW9uIiA9IDIKClsic29jIl0KIm5hbWUiID0gInNtNzQ3NSIKImRlc2NyaXB0aW9uIiA9ICJRdWFsY29tbSBTTTc0NzUgKFNuYXBkcmFnb24gNysgR2VuIDIsIHBsYXRmb3JtIHVrZWUpIgojIFRPRE86IHBvaW50IGF0IHRoZSBtYWlubGluZSAob3IgdmVuZG9yKSBkdHMgc291cmNlIHRoZSB2YWx1ZXMgd2VyZSB0YWtlbiBmcm9tLgojIE91ciB2YWx1ZXMgY29tZSBmcm9tIHRoZSBwaG9uZSdzIG93biBkZXZpY2UgdHJlZSAobWFyYmxlLmR0YiwgYC9zb2NgIG5vZGVzKSBhbmQgdGhlIE11LVNpbGljaXVtCiMgTWVtb3J5TWFwTGliOyBpZiBhIHNtNzQ3NSBtYWlubGluZSB0cmVlIGV4aXN0cywgcGluIGl0IGhlcmUgaW5zdGVhZC4KInNvdXJjZV9yZXBvc2l0b3J5IiA9ICJodHRwczovL2dpdGh1Yi5jb20vVW5pWE5VL1VuaVhOVS1zbTc0NzUtY29tbW9uIgoic291cmNlX3JldmlzaW9uIiA9ICIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIgoKWyJjb21wb25lbnRzIl0KIyBBcm1DcHUvQXJtRFRQbGF0Zm9ybSBhcmUgU29DLWFnbm9zdGljLiBUaGUgR1BVIGRyaXZlciBpcyBub3Qgc2VsZWN0ZWQgeWV0OiBtYXJibGUgaXMgQWRyZW5vIDcyNSwKIyB3aGlsZSB0aGUgZXhpc3RpbmcgY29tcG9uZW50IGlzIEFkcmVubzc0MCAoQWRyZW5vIDc0MCkuIFN0YXJ0IHdpdGhvdXQgYSBHUFUgZHJpdmVyLgoiaW5jbHVkZSIgPSBbIkFybUNwdSIsICJBcm1EVFBsYXRmb3JtIl0K' | base64 -d > unixnu/UniXNU-sm7475-common/soc.toml
-          mkdir -p unixnu/UniXNU-sm7475-common/configs
-          printf '%s' 'IyBVbmlYTlUtc203NDc1LWNvbW1vbiAvIGNvbmZpZ3Mvc203NDc1LmNvbmZpZwojCiMgVGhlIFNNODU1MCBmaWxlIGlzIGEgc2luZ2xlIGxpbmUgKENPTkZJR19YTlVfTkFUSVZFX0FEUkVOTz15KTsgdGhlIFNvQyBmcmFnbWVudCBpcyBmb3Igc3dpdGNoZXMgdGhlCiMgc2hhcmVkIHBsYXRmb3JtIGNvZGUgcmVhZHMsIG5vdCBmb3IgYm9hcmQgd2lyaW5nLiBtYXJibGUgc3RhcnRzIHdpdGhvdXQgYSBHUFUgZHJpdmVyLCBzbyB0aGVyZSBpcwojIG5vdGhpbmcgdG8gZW5hYmxlIHlldC4KIwojIFRPRE8gb25jZSBhbiBBZHJlbm8gNzI1IGNvbXBvbmVudCBleGlzdHM6CiMgQ09ORklHX1hOVV9OQVRJVkVfQURSRU5PPXkKQ09ORklHX1hOVV9BUk1WSVJUX1BMQVRGT1JNPW4K' | base64 -d > unixnu/UniXNU-sm7475-common/configs/sm7475.config
-          mkdir -p unixnu/UniXNU-sm7475-common/dts
-          printf '%s' 'Ly8gU1BEWC1MaWNlbnNlLUlkZW50aWZpZXI6IEJTRC0zLUNsYXVzZQovLyBVbmlYTlUtc203NDc1LWNvbW1vbiAvIGR0cy9zbTc0NzUuZHRzaSDigJQgRFJBRlQKLy8KLy8gVmFsdWVzIGZyb20gdGhlIHBob25lJ3Mgb3duIGRldmljZSB0cmVlIChtYXJibGUuZHRiKSBhbmQgdGhlIFVFRkkgbWVtb3J5IG1hcCwgaW4gdGhlIHNoYXBlCi8vIFVuaVhOVS1zbTg1NTAtY29tbW9uIHVzZXM6IGEgbWluaW1hbCBoYW5kLXdyaXR0ZW4gZHRzaSwgbm90IHRoZSB2ZW5kb3IgZHRiLgovLyBgdW5peG51LGFkdC1uYW1lYCBpcyB3aGF0IERhcndpbkJvb3QgaGFuZHMgdG8gWE5VJ3MgQURUOyBrZWVwIHRoZSBuYW1lcyBpbiBzdGVwIHdpdGggdGhlIGRyaXZlcnMuCgovIHsKICAgIGNvbXBhdGlibGUgPSAicWNvbSxzbTc0NzUiOwogICAgI2FkZHJlc3MtY2VsbHMgPSA8Mj47CiAgICAjc2l6ZS1jZWxscyA9IDwyPjsKICAgIGludGVycnVwdC1wYXJlbnQgPSA8JmdpYz47CgogICAgY3B1cyB7CiAgICAgICAgI2FkZHJlc3MtY2VsbHMgPSA8Mj47CiAgICAgICAgI3NpemUtY2VsbHMgPSA8MD47CiAgICAgICAgdGltZWJhc2UtZnJlcXVlbmN5ID0gPDE5MjAwMDAwPjsgICAgICAgICAgICAgICAgIC8qIENOVEZSUSB0aGUgbG9hZGVyIHJlcG9ydHMgKi8KCiAgICAgICAgLyogbGl0dGxlIGNsdXN0ZXI6IDQgeCBDb3J0ZXgtQTUxMCwgY2FwYWNpdHktZG1pcHMtbWh6IDEwMjQgKi8KICAgICAgICBjcHUwOiBjcHVAMCAgIHsgZGV2aWNlX3R5cGUgPSAiY3B1IjsgY29tcGF0aWJsZSA9ICJhcm0sY29ydGV4LWE1MTAiOyByZWcgPSA8MCAweDAwMD47IH07CiAgICAgICAgY3B1MTogY3B1QDEwMCB7IGRldmljZV90eXBlID0gImNwdSI7IGNvbXBhdGlibGUgPSAiYXJtLGNvcnRleC1hNTEwIjsgcmVnID0gPDAgMHgxMDA+OyB9OwogICAgICAgIGNwdTI6IGNwdUAyMDAgeyBkZXZpY2VfdHlwZSA9ICJjcHUiOyBjb21wYXRpYmxlID0gImFybSxjb3J0ZXgtYTUxMCI7IHJlZyA9IDwwIDB4MjAwPjsgfTsKICAgICAgICBjcHUzOiBjcHVAMzAwIHsgZGV2aWNlX3R5cGUgPSAiY3B1IjsgY29tcGF0aWJsZSA9ICJhcm0sY29ydGV4LWE1MTAiOyByZWcgPSA8MCAweDMwMD47IH07CgogICAgICAgIC8qIG1pZCBjbHVzdGVyOiAzIHggQ29ydGV4LUE3MTAsIGNhcGFjaXR5IDIyNTMgKi8KICAgICAgICBjcHU0OiBjcHVANDAwIHsgZGV2aWNlX3R5cGUgPSAiY3B1IjsgY29tcGF0aWJsZSA9ICJhcm0sY29ydGV4LWE3MTAiOyByZWcgPSA8MCAweDQwMD47IH07CiAgICAgICAgY3B1NTogY3B1QDUwMCB7IGRldmljZV90eXBlID0gImNwdSI7IGNvbXBhdGlibGUgPSAiYXJtLGNvcnRleC1hNzEwIjsgcmVnID0gPDAgMHg1MDA+OyB9OwogICAgICAgIGNwdTY6IGNwdUA2MDAgeyBkZXZpY2VfdHlwZSA9ICJjcHUiOyBjb21wYXRpYmxlID0gImFybSxjb3J0ZXgtYTcxMCI7IHJlZyA9IDwwIDB4NjAwPjsgfTsKCiAgICAgICAgLyogcHJpbWU6IDEgeCBDb3J0ZXgtWDIsIGNhcGFjaXR5IDIzODYgKi8KICAgICAgICBjcHU3OiBjcHVANzAwIHsgZGV2aWNlX3R5cGUgPSAiY3B1IjsgY29tcGF0aWJsZSA9ICJhcm0sY29ydGV4LXgyIjsgICByZWcgPSA8MCAweDcwMD47IH07CiAgICB9OwoKICAgIHBzY2kgeyBjb21wYXRpYmxlID0gImFybSxwc2NpLTEuMCI7IG1ldGhvZCA9ICJzbWMiOyB9OwoKICAgIHNvYyB7CiAgICAgICAgY29tcGF0aWJsZSA9ICJzaW1wbGUtYnVzIjsKICAgICAgICAjYWRkcmVzcy1jZWxscyA9IDwyPjsKICAgICAgICAjc2l6ZS1jZWxscyA9IDwyPjsKICAgICAgICByYW5nZXM7CgogICAgICAgIGdpYzogaW50ZXJydXB0LWNvbnRyb2xsZXJAMTcxMDAwMDAgewogICAgICAgICAgICBjb21wYXRpYmxlID0gImFybSxnaWMtdjMiOwogICAgICAgICAgICB1bml4bnUsYWR0LW5hbWUgPSAiaW50YyI7CiAgICAgICAgICAgIC8qIGRpc3QgMHgxNzEwMDAwMCAoNjQgS2lCKSwgcmVkaXN0IDB4MTcxODAwMDAgKDIgTWlCKSDigJQgZnJvbSBtYXJibGUuZHRiICovCiAgICAgICAgICAgIHJlZyA9IDwwIDB4MTcxMDAwMDAgMCAweDEwMDAwPiwgPDAgMHgxNzE4MDAwMCAwIDB4MjAwMDAwPjsKICAgICAgICAgICAgI2ludGVycnVwdC1jZWxscyA9IDw0PjsKICAgICAgICAgICAgI2FkZHJlc3MtY2VsbHMgPSA8MD47CiAgICAgICAgICAgIGludGVycnVwdC1jb250cm9sbGVyOwogICAgICAgICAgICByZWRpc3RyaWJ1dG9yLXN0cmlkZSA9IDwwIDB4NDAwMDA+OyAgICAgICAgICAvKiB2ZXJpZnkgb24gbWFyYmxlICg4IGNvcmVzKSAqLwogICAgICAgIH07CgogICAgICAgIC8qIHNhbWUgYWRkcmVzc2VzIGFzIFNNODU1MDogdGhlIFFNUCB2NCAiY2FwZSIgVUZTIGJsb2NrICovCiAgICAgICAgdWZzOiB1ZnNoY0AxZDg0MDAwIHsKICAgICAgICAgICAgY29tcGF0aWJsZSA9ICJxY29tLHNtNzQ3NS11ZnNoYyIsICJxY29tLHVmc2hjIjsKICAgICAgICAgICAgdW5peG51LGFkdC1uYW1lID0gInVmc2hjIjsKICAgICAgICAgICAgcmVnID0gPDAgMHgxZDg0MDAwIDAgMHgzMDAwPjsKICAgICAgICAgICAgc3RhdHVzID0gImRpc2FibGVkIjsKICAgICAgICB9OwoKICAgICAgICB1ZnNwaHk6IHBoeUAxZDgwMDAwIHsKICAgICAgICAgICAgY29tcGF0aWJsZSA9ICJxY29tLHNtNzQ3NS1xbXAtdWZzLXBoeSIsICJxY29tLHFtcC11ZnMtcGh5IjsKICAgICAgICAgICAgdW5peG51LGFkdC1uYW1lID0gInVmc3BoeSI7CiAgICAgICAgICAgIHJlZyA9IDwwIDB4MWQ4MDAwMCAwIDB4MjAwMD47CiAgICAgICAgICAgIHN0YXR1cyA9ICJkaXNhYmxlZCI7CiAgICAgICAgfTsKCiAgICAgICAgLyogQWRyZW5vIDcyNTogbWFyYmxlLmR0YiBzYXlzICJxY29tLGFkcmVuby1ncHUtZ2VuNy00LTAiIChhN3h4KS4gTm8gZHJpdmVyIHlldC4gKi8KICAgICAgICBncHU6IGdwdUAzZDAwMDAwIHsKICAgICAgICAgICAgY29tcGF0aWJsZSA9ICJxY29tLGFkcmVuby1ncHUtZ2VuNy00LTAiLCAicWNvbSxhZHJlbm8iOwogICAgICAgICAgICB1bml4bnUsYWR0LW5hbWUgPSAiZ3B1IjsKICAgICAgICAgICAgcmVnID0gPDAgMHgzZDAwMDAwIDAgMHg0MDAwMD47CiAgICAgICAgICAgIHJlZy1uYW1lcyA9ICJrZ3NsXzNkMF9yZWdfbWVtb3J5IjsKICAgICAgICAgICAgc3RhdHVzID0gImRpc2FibGVkIjsKICAgICAgICB9OwogICAgfTsKfTsK' | base64 -d > unixnu/UniXNU-sm7475-common/dts/sm7475.dtsi
-          mkdir -p unixnu/UniXNU-sm7475-common/patches/xnu
-          printf '%s' 'IyBVbmlYTlUtc203NDc1LWNvbW1vbiAvIHBhdGNoZXMveG51L3NlcmllcwojCiMgT25lIFhOVSBwYXRjaCBwZXIgbGluZSwgYXBwbGllZCBpbiB0aGlzIG9yZGVyICh0aGUgc2FtZSBmb3JtYXQgYXMKIyBVbmlYTlUtc204NTUwLWNvbW1vbi9wYXRjaGVzL3hudS9zZXJpZXMpLiBFbXB0eSBpcyB2YWxpZDogdGhlIGFyY2gsIE9TIGFuZCBkZXZpY2Ugc2VyaWVzIHN0aWxsIGFwcGx5LgojIFNvQy1zcGVjaWZpYyBYTlUgY2hhbmdlcyAoaW50ZXJydXB0IGNvbnRyb2xsZXIgcXVpcmtzLCB0aW1lciwgQ1BVIGJyaW5nLXVwKSBnbyBoZXJlIG9uY2UgbmVlZGVkLgo=' | base64 -d > unixnu/UniXNU-sm7475-common/patches/xnu/series
-          mkdir -p unixnu/UniXNU-sm7475-common/kits
-          printf '%s' 'IyBVbmlYTlUtc203NDc1LWNvbW1vbiAvIGtpdHMvCiMKIyBTaGFyZWQgcGxhdGZvcm0gb3BlcmF0aW9ucyBmb3IgdGhlIFNvQyAodGhlIFNNODU1MCByZXBvc2l0b3J5IGtlZXBzIGl0cyBraXRzIGhlcmUgYW5kIHdpcmVzIHRoZW0KIyB0aHJvdWdoIGJvYXJkLnRvbWwgYFtrZXJuZWxdIGFyY2hpdmVzYCkuIE5vdGhpbmcgZm9yIG1hcmJsZSB5ZXQ6IHRoZSBmaXJzdCBicmluZy11cCBvbmx5IG5lZWRzCiMgQXJtQ3B1IC8gQXJtRFRQbGF0Zm9ybSwgd2hpY2ggbGl2ZSBpbiBVbmlYTlUgaXRzZWxmLgo=' | base64 -d > unixnu/UniXNU-sm7475-common/kits/README.md
+      - name: hackios uefi port (the marble platform lives there)
+        run: git clone --depth 1 https://github.com/oosexgang/hackios-xnu-kernel.git hackios
 
-      - name: wire the marble repositories as local feeds
+      - name: Mu-Silicium at the pinned commit
+        run: |
+          BASE=$(tr -d ' \n' < hackios/uefi/BASE)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          git clone https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+          git -C Mu-Silicium checkout "$BASE"
+          git -C Mu-Silicium submodule update --init --recursive
+
+      - name: apply the HackiOS changes
+        run: |
+          git -C Mu-Silicium apply --whitespace=nowarn "$GITHUB_WORKSPACE/hackios/uefi/mu-silicium.patch"
+          cp -r hackios/uefi/files/. Mu-Silicium/
+          test -d Mu-Silicium/Platforms/Xiaomi/marblePkg
+          test -f Mu-Silicium/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/XnuLoader.c
+
+      - name: point the XnuLoader hook at marble's PAYLOAD_BASE
+        run: |
+          H=Mu-Silicium/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/XnuLoader.h
+          sed -i 's|^#define XNU_PAYLOAD_BASE .*|#define XNU_PAYLOAD_BASE      0xAA000000ULL|' "$H"
+          grep -n 'XNU_PAYLOAD_BASE' "$H"
+
+      - name: comment out the marble ACPI table references
+        run: |
+          for f in $(grep -rl 'marble/AcpiTables\.inf' Mu-Silicium/Platforms/Xiaomi/marblePkg); do
+            sed -i '/marble\/AcpiTables\.inf/{/^[[:space:]]*#/!s|^|# |}' "$f"
+          done
+          grep -rn 'AcpiTables' Mu-Silicium/Platforms/Xiaomi/marblePkg || true
+
+      - name: UniXNU packages (package/ and DarwinBoot only)
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/UniXNU/UniXNU.git UniXNU
+          git -C UniXNU sparse-checkout init --cone
+          git -C UniXNU sparse-checkout set package drivers/DarwinBoot
+          git -C UniXNU checkout
+          git -C UniXNU submodule update --init --depth 1 drivers/DarwinBoot
+          echo "--- package ---";      ls UniXNU/package | head -20
+          echo "--- DarwinBoot ---";   ls UniXNU/drivers/DarwinBoot | head -20
+          find UniXNU -maxdepth 3 -name '*.dec' | head -10
+          find UniXNU -name 'DarwinBoot.inf' | head -5
+
+      - name: add the packages to marble.dsc and marble.fdf
         run: |
           set -e
-          DEV=$PWD/unixnu/UniXNU-marble
-          SOC=$PWD/unixnu/UniXNU-sm7475-common
-          test -f "$DEV/board.toml"
-          test -f "$SOC/soc.toml"
+          M=Mu-Silicium/Platforms/Xiaomi/marblePkg
+          DSC=$M/marble.dsc
+          FDF=$M/marble.fdf
 
-          # feeds.toml wants a git revision, so make both directories repositories
-          for d in "$SOC" "$DEV"; do
-            if [ ! -d "$d/.git" ]; then
-              git -C "$d" init -q -b main
-              git -C "$d" add -A
-              git -C "$d" -c user.email=ci@example.invalid -c user.name=ci commit -qm "ci snapshot"
-            fi
-          done
+          # [LibraryClasses] first, so the component entries can use them
+          grep -q 'UniXNULib|' "$DSC" || \
+            sed -i '/^\[LibraryClasses\]/a\  UniXNULib|UniXNUPkg/Library/UniXNULib/UniXNULib.inf' "$DSC"
+          grep -q 'FdtLib|' "$DSC" || \
+            sed -i '/^\[LibraryClasses\]/a\  FdtLib|MdePkg/Library/BaseFdtLib/BaseFdtLib.inf' "$DSC"
 
-          COMMIT=$(git -C "$SOC" rev-parse HEAD)
-          printf '[[source]]\nkind = "soc"\nname = "sm7475"\ngit = "file://%s"\ncommit = "%s"\n' \
-            "$SOC" "$COMMIT" > "$DEV/feeds.toml"
-          cat "$DEV/feeds.toml"
+          # [Components]
+          grep -q 'UniXNU/UniXNU.inf' "$DSC" || \
+            sed -i '/^\[Components\]/a\  UniXNUPkg/Application/UniXNU/UniXNU.inf' "$DSC"
+          grep -q 'UniXNUDxe.inf' "$DSC" || \
+            sed -i '/^\[Components\]/a\  UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf' "$DSC"
+          grep -q 'UniXNURamDiskDxe.inf' "$DSC" || \
+            sed -i '/^\[Components\]/a\  UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.inf' "$DSC"
+          grep -q 'DarwinBoot.inf' "$DSC" || \
+            sed -i '/^\[Components\]/a\  DarwinBootPkg/Driver/DarwinBoot.inf' "$DSC"
 
-      - name: configure
+          # FvMain is the volume that ends up inside the FD
+          grep -q 'UniXNU/UniXNU.inf' "$FDF" || \
+            sed -i '/^\[FV.FvMain\]/a\  INF UniXNUPkg/Application/UniXNU/UniXNU.inf' "$FDF"
+          grep -q 'INF UniXNUPkg/Driver/UniXNUDxe' "$FDF" || \
+            sed -i '/^\[FV.FvMain\]/a\  INF UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf' "$FDF"
+          grep -q 'INF UniXNUPkg/Driver/UniXNURamDiskDxe' "$FDF" || \
+            sed -i '/^\[FV.FvMain\]/a\  INF UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.inf' "$FDF"
+          grep -q 'INF DarwinBootPkg/Driver/DarwinBoot' "$FDF" || \
+            sed -i '/^\[FV.FvMain\]/a\  INF DarwinBootPkg/Driver/DarwinBoot.inf' "$FDF"
+
+          echo "===== DSC [Components] head ====="; sed -n '/^\[Components\]/,+10p' "$DSC"
+          echo "===== DSC LibraryClasses hits ====="; grep -n 'UniXNULib\|FdtLib' "$DSC"
+          echo "===== FDF FvMain head ====="; sed -n '/^\[FV.FvMain\]/,+12p' "$FDF"
+
+      - name: mu_nasm without Mono
         run: |
-          cd unixnu/UniXNU
-          ./unixnu defconfig marble_defconfig -D ../UniXNU-marble
-          ./unixnu status --json | head -100
+          D=Mu-Silicium/Mu_Basecore/BaseTools/Bin/mu_nasm_extdep
+          mkdir -p "$D/Linux-x86-64"
+          echo 'version: 20016.1.1' > "$D/extdep_state.yaml"
+          ln -sf /usr/bin/nasm "$D/Linux-x86-64/nasm"
+          ln -sf /usr/bin/ndisasm "$D/Linux-x86-64/ndisasm"
 
-      - name: build the packages
+      - name: build the FD with UniXNU packages on the search path
         run: |
-          cd unixnu/UniXNU
-          ./unixnu tree
-          ./unixnu build package > /tmp/pkg.log 2>&1 || true
-          echo "===== tail of the package build ====="
-          tail -70 /tmp/pkg.log
-          echo "===== what was produced ====="
-          find out/marble -type f \( -name '*.efi' -o -name '*.a' \) -printf '%p %s\n' 2>/dev/null | head -50
-          find out/marble -type f -name '*.efi' | grep -q . || { echo "no .efi produced"; exit 1; }
+          # where the packages need to be visible from: the directory that CONTAINS UniXNUPkg, and the
+          # one that contains DarwinBootPkg
+          if [ -d UniXNU/package/UniXNUPkg ]; then PKGROOT=$PWD/UniXNU/package; else PKGROOT=$PWD/UniXNU; fi
+          DBPKG=$(dirname "$(find UniXNU/drivers/DarwinBoot -name DarwinBoot.inf | head -1)")
+          DBPKG=${DBPKG%/Driver}
+          echo "PKGROOT=$PKGROOT"; echo "DBPKG=$DBPKG"
+          test -d "$PKGROOT/UniXNUPkg" ; test -d "$DBPKG/DarwinBootPkg"
+          echo "PACKAGES_PATH=$PKGROOT:$DBPKG:$PWD/Mu-Silicium" >> "$GITHUB_ENV"
+
+          python3 -m venv --clear venv
+          venv/bin/python -c "import tomllib"
+          venv/bin/pip install -q --upgrade pip
+          venv/bin/pip install -q -r Mu-Silicium/pip-requirements.txt
+          cd Mu-Silicium
+          ../venv/bin/python build_uefi.py -d marble -r RELEASE 2>&1 | tail -60
+          ls -l Build/marblePkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
+
+      - name: build the boot shim for marble's addresses
+        run: |
+          rm -f Mu-Silicium/BootShim/BootShim.elf Mu-Silicium/BootShim/BootShim.bin
+          make -C Mu-Silicium/BootShim REQUIRES_KERNEL_HEADER=1 \
+            FD_BASE="$FD_BASE" FD_SIZE="$FD_SIZE" \
+            CFLAGS="--target=aarch64-linux-gnu -DPAYLOAD_BASE=$PAYLOAD_BASE"
+          ls -l Mu-Silicium/BootShim/BootShim.bin
+
+      - name: check sizes
+        run: |
+          FD=Mu-Silicium/Build/marblePkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
+          ls -l "$FD" Mu-Silicium/BootShim/BootShim.bin
+          python3 - "$FD" "$FD_SIZE" <<'PY'
+          import os, sys
+          size, want = os.path.getsize(sys.argv[1]), int(sys.argv[2], 0)
+          print(f"FD {size} bytes, expected {want}")
+          sys.exit(0 if size == want else 1)
+          PY
 
       - uses: actions/upload-artifact@v4
         with:
-          name: unixnu-package-marble
+          name: unixnu-marble-uefi
           if-no-files-found: error
           path: |
-            unixnu/UniXNU/out/marble/**/*.efi
-            unixnu/UniXNU/out/marble/**/*.a
+            Mu-Silicium/Build/marblePkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
+            Mu-Silicium/BootShim/BootShim.bin
