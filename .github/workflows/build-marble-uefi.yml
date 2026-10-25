@@ -85,19 +85,14 @@ jobs:
 
       - name: build the boot shim
         run: |
-          make -C Mu-Silicium/BootShim REQUIRES_KERNEL_HEADER=1 \
-            FD_BASE="$FD_BASE" FD_SIZE="$FD_SIZE" \
-            CFLAGS="--target=aarch64-linux-gnu -DPAYLOAD_BASE=$PAYLOAD_BASE"
-
-      - name: verify the shim really has the payload copy
-        run: |
+          # build_uefi.py left an up-to-date shim built WITHOUT -DPAYLOAD_BASE; drop it first
+          rm -f Mu-Silicium/BootShim/BootShim.elf Mu-Silicium/BootShim/BootShim.bin
           make -C Mu-Silicium/BootShim REQUIRES_KERNEL_HEADER=1 \
             FD_BASE="$FD_BASE" FD_SIZE="$FD_SIZE" \
             CFLAGS="--target=aarch64-linux-gnu -DPAYLOAD_BASE=$PAYLOAD_BASE"
           ls -l Mu-Silicium/BootShim/BootShim.bin
-          llvm-objdump -d Mu-Silicium/BootShim/BootShim.elf | grep -E 'movz.*0xaa00|movz.*0xAA00' \
-            && echo "payload copy present" \
-            || { echo "NO payload copy in the shim -> -DPAYLOAD_BASE did not reach the assembler"; exit 1; }
+          llvm-objdump -d Mu-Silicium/BootShim/BootShim.elf | grep -iE 'movz[[:space:]]+x5, #0xaa00' \
+            || { echo "no payload copy in shim"; exit 1; }
 
       - name: check the artifact sizes
         run: |
