@@ -92,14 +92,16 @@ jobs:
           echo "UNIXNU_DEVICE=$RUNNER_TEMP/marble/device" >> "$GITHUB_ENV"
 
       - name: Resolve the configuration
-        run: |
-          ./unixnu defconfig marble_defconfig
-          ./unixnu status --json | tail -n 40
+        run: ./unixnu defconfig marble_defconfig
 
       - name: Fetch sources
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./unixnu fetch
+        run: |
+          # The module submodules (kits/XnuPrelink and friends) only exist after this step, and the OS profile
+          # patch series references them, so the status report has to come after the fetch, not before it.
+          ./unixnu fetch
+          ./unixnu status --json | tail -n 40
 
       - name: Fetch the IPSW members
         run: ./unixnu ipsw fetch
