@@ -1,0 +1,93 @@
+name: build-marble-touch-kernel
+
+# Builds yukoimi/hackios-marble's source kernel (marble touch / display / GPU / audio drivers) on a Linux
+# runner, following the tree's own tools/marble-linux-build.sh recipe.
+#
+# The produced mach.marble-source is the XNU binary that carries the marble drivers; it is staged through the
+# normal HackiOS boot chain (Mu-marble.img UEFI + loader.efi + XNUP payload).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout the marble tree
+        uses: actions/checkout@v4
+        with:
+          repository: yukoimi/hackios-marble
+          path: marble
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl clang lld llvm python3 flex bison m4 \
+            autoconf automake libtool pkg-config libxml2-dev libssl-dev \
+            cmake ninja-build rsync zlib1g-dev libzstd-dev uuid-dev libbsd-dev gawk
+          clang --version
+          ld.lld --version
+
+      - name: Prepare Theos and the toolchain
+        working-directory: marble
+        env:
+          THEOS: /home/runner/theos
+        run: |
+          mkdir -p "$THEOS"
+          bash tools/marble-linux-build.sh setup 2>&1 | tee out-setup.log || {
+            echo "===== setup failed, tail ====="
+            tail -60 out-setup.log
+            exit 1
+          }
+
+      - name: Build the kernel
+        working-directory: marble
+        env:
+          THEOS: /home/runner/theos
+          JOBS: 4
+        run: |
+          set +e
+          bash tools/marble-linux-build.sh kernel 2>&1 | tee out-kernel.log
+          rc=$?
+          echo "build script exit: $rc"
+          ls -l out/linux-build/ || true
+          exit 0
+
+      - name: Surface the diagnostics
+        if: always()
+        working-directory: marble
+        run: |
+          echo "===== out/linux-build ====="
+          ls -l out/linux-build/ 2>/dev/null || true
+          if [ -f out/linux-build/kernel.log ]; then
+            echo "===== kernel.log: errors ====="
+            grep -n -E 'error:|Undefined symbols|ld: |linker command failed|fatal error' out/linux-build/kernel.log | head -60 || true
+            echo "===== kernel.log: tail ====="
+            tail -40 out/linux-build/kernel.log
+          fi
+          echo "===== setup log tail ====="
+          tail -20 out-setup.log 2>/dev/null || true
+          echo done
+
+      - name: Collect the artifacts
+        if: always()
+        run: |
+          mkdir -p dist
+          cp marble/out/linux-build/mach.marble-source dist/ 2>/dev/null || true
+          cp marble/out/linux-build/mach.json dist/ 2>/dev/null || true
+          cp marble/out/linux-build/kernel.log dist/ 2>/dev/null || true
+          cp marble/out/linux-build/kernel.syms dist/ 2>/dev/null || true
+          cp marble/out-setup.log dist/ 2>/dev/null || true
+          cp marble/out-kernel.log dist/ 2>/dev/null || true
+          ls -l dist
+
+      - name: Upload the artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-touch-kernel
+          path: dist
+          if-no-files-found: warn
+          retention-days: 14
