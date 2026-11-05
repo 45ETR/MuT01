@@ -34,10 +34,9 @@ defaults:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 360
     env:
-      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
       STEPS: ${{ inputs.steps }}
     steps:
       - name: Check out UniXNU
@@ -59,6 +58,22 @@ jobs:
             brew install unifdef
             echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
           fi
+
+      - name: Select Xcode
+        run: |
+          pick="/Applications/Xcode_${{ inputs.xcode }}.app"
+          if [ ! -d "$pick" ]; then
+            pick=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+            echo "Xcode_${{ inputs.xcode }} is not on this image; falling back to $pick"
+          fi
+          if [ -z "$pick" ] || [ ! -d "$pick" ]; then
+            echo "no Xcode installation found in /Applications" >&2
+            ls -d /Applications/Xcode* 2>/dev/null >&2 || true
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$pick/Contents/Developer" >> "$GITHUB_ENV"
+          echo "selected $pick"
+          "$pick/Contents/Developer/usr/bin/xcodebuild" -version
 
       - name: Report the runner toolchain
         run: |
