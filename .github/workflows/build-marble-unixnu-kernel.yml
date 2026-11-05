@@ -158,6 +158,18 @@ jobs:
             echo "--- $file"
             tail -30 "$file"
           done
+          echo "===== every archive log error"
+          for file in $(find out -name 'archive-*.log' -type f | sort); do
+            hits=$(grep -c -E 'error:|fatal error:' "$file")
+            if [ "${hits:-0}" -gt 0 ]; then
+              echo "--- $file ($hits error lines)"
+              grep -n -E 'error:|fatal error:' "$file" | head -20
+              firstline=$(grep -n -m1 -E 'error:|fatal error:' "$file" | cut -d: -f1)
+              start=$(( firstline > 25 ? firstline - 25 : 1 ))
+              echo "----- context"
+              sed -n "${start},$(( firstline + 25 ))p" "$file"
+            fi
+          done
           echo "===== prelink products"
           for directory in $(find out -type d -name xnu-prelink | head -2); do
             echo "--- $directory"
