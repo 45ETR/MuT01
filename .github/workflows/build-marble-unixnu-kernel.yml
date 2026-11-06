@@ -43,7 +43,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: UniXNU/UniXNU
-          ref: main
+          # Pinned: upstream main moved its drivers/ArmCpu submodule to a commit its
+          # remote no longer serves (upload-pack: not our ref), which breaks
+          # ./unixnu fetch.  This is the revision every marble build so far used.
+          ref: 16e592abee8a550dec8154ed1f38b5ebc4f16213
           path: .
           persist-credentials: false
 
