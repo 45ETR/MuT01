@@ -95,6 +95,10 @@ jobs:
         run: |
           set -e
           cd tree
+          # Some of the shipped patches carry hunk headers whose line counts are stale (the work was edited
+          # after the patch was cut); --recount makes git recalculate them instead of refusing the patch.
+          perl -pi -e 's/git apply --whitespace=nowarn/git apply --whitespace=nowarn --recount/' xnu26/apply.sh
+          grep -n 'git apply' xnu26/apply.sh
           bash xnu26/apply.sh
           echo "--- patches applied:"
           wc -l < xnu26/patches/series
