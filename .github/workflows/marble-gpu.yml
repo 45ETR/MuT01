@@ -1,0 +1,175 @@
+name: build-marble-touch-kernel
+
+# Builds yukoimi/hackios-marble's source kernel (marble touch / display / GPU / audio drivers) on a Linux
+# runner, following the tree's own tools/marble-linux-build.sh recipe.
+#
+# The produced mach.marble-source is the XNU binary that carries the marble drivers; it is staged through the
+# normal HackiOS boot chain (Mu-marble.img UEFI + loader.efi + XNUP payload).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout the marble tree
+        uses: actions/checkout@v4
+        with:
+          repository: yukoimi/hackios-marble
+          path: marble
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl clang lld llvm python3 flex bison m4 \
+            autoconf automake libtool pkg-config libxml2-dev libssl-dev \
+            cmake ninja-build rsync zlib1g-dev libzstd-dev uuid-dev libbsd-dev gawk
+          clang --version
+          ld.lld --version
+
+      - name: Prepare Theos and the toolchain
+        working-directory: marble
+        env:
+          THEOS: /home/runner/theos
+        run: |
+          mkdir -p "$THEOS"
+          bash tools/marble-linux-build.sh setup 2>&1 | tee out-setup.log || {
+            echo "===== setup failed, tail ====="
+            tail -60 out-setup.log
+            exit 1
+          }
+
+      - name: Patch the GPU readiness test
+        working-directory: marble
+        run: |
+          set -e
+          python3 - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path('xnu/files/bsd/dev/marble_adreno.c')
+          s = p.read_text()
+          old = 'bool marble_gpu_ready(void)\n{return __atomic_load_n(&service_started,__ATOMIC_ACQUIRE) && __atomic_load_n(&runtime_inflight,__ATOMIC_ACQUIRE);}'
+          new = ('bool marble_gpu_ready(void)\n'
+                 '{/* the service stays ready once started: runtime_inflight is 0 whenever the\n'
+                 '  * GPU is idle, and the user client (Mesa freedreno) is opened exactly then. */\n'
+                 ' return __atomic_load_n(&service_started,__ATOMIC_ACQUIRE) && !__atomic_load_n(&runtime_stop_requested,__ATOMIC_ACQUIRE);}')
+          if old not in s:
+              sys.exit('marble_gpu_ready: pattern not found')
+          p.write_text(s.replace(old, new, 1))
+          print('patched marble_gpu_ready')
+
+          # And say, in the log, whether a program was even given a client.
+          q = pathlib.Path('xnu/files/iokit/Kernel/RedwoodGPU.cpp')
+          t = q.read_text()
+
+          old1 = ("\tif (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {\n"
+                  "\t\treturn false;\n"
+                  "\t}\n"
+                  "\tfTask = owningTask;")
+          new1 = ("\tIOLog(\"RedwoodGPU: a user client is asked for (type %u, ready %d)\\n\", (unsigned) type,\n"
+                  "\t    (int) redwood_gpu_ready());\n"
+                  "\tif (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {\n"
+                  "\t\tIOLog(\"RedwoodGPU: IOUserClient::initWithTask refused the client\\n\");\n"
+                  "\t\treturn false;\n"
+                  "\t}\n"
+                  "\tfTask = owningTask;")
+          if old1 not in t:
+              sys.exit('RedwoodGPUUserClient::initWithTask: pattern not found')
+          t = t.replace(old1, new1, 1)
+
+          old2 = ("\tif (!redwood_gpu_ready() || !IOUserClient::start(provider)) {\n"
+                  "\t\treturn false;\n"
+                  "\t}")
+          new2 = ("\tif (!redwood_gpu_ready()) {\n"
+                  "\t\tIOLog(\"RedwoodGPU: the client is not started: the GPU is not ready\\n\");\n"
+                  "\t\treturn false;\n"
+                  "\t}\n"
+                  "\tif (!IOUserClient::start(provider)) {\n"
+                  "\t\tIOLog(\"RedwoodGPU: IOUserClient::start refused the client\\n\");\n"
+                  "\t\treturn false;\n"
+                  "\t}\n"
+                  "\tIOLog(\"RedwoodGPU: a user client is open\\n\");")
+          if old2 not in t:
+              sys.exit('RedwoodGPUUserClient::start: pattern not found')
+          t = t.replace(old2, new2, 1)
+          q.write_text(t)
+          print('instrumented RedwoodGPUUserClient')
+
+          # The GPU ladder runs in a kernel thread, so the service appears long after
+          # SpringBoard has asked for its OpenGL ES context, and Mesa keeps softpipe for
+          # the life of that process. The start must not return before the service exists.
+          m = pathlib.Path('xnu/files/bsd/dev/marble_adreno.c')
+          u = m.read_text()
+          old3 = ("        if(kernel_thread_start(marble_runtime_thread,NULL,&worker)!=KERN_SUCCESS) {\n"
+                  "            __atomic_store_n(&runtime_inflight,0,__ATOMIC_RELEASE);\n"
+                  "            marble_gpu_log(\"marble-gpu-runtime: worker creation failed\\n\");\n"
+                  "        } else thread_deallocate(worker);")
+          new3 = ("        if(kernel_thread_start(marble_runtime_thread,NULL,&worker)!=KERN_SUCCESS) {\n"
+                  "            __atomic_store_n(&runtime_inflight,0,__ATOMIC_RELEASE);\n"
+                  "            marble_gpu_log(\"marble-gpu-runtime: worker creation failed\\n\");\n"
+                  "        } else {\n"
+                  "            unsigned waited=0;\n"
+                  "            for(;waited<3000;waited++) {\n"
+                  "                if(__atomic_load_n(&service_started,__ATOMIC_ACQUIRE))break;\n"
+                  "                delay(10000);\n"
+                  "            }\n"
+                  "            marble_gpu_log(\"marble-gpu-runtime: waited %u ms for the service\\n\",waited*10);\n"
+                  "            thread_deallocate(worker);\n"
+                  "        }")
+          if old3 not in u:
+              sys.exit('marble_runtime_thread start: pattern not found')
+          m.write_text(u.replace(old3, new3, 1))
+          print('made the GPU start wait for its service')
+          PY
+
+      - name: Build the kernel
+        working-directory: marble
+        env:
+          THEOS: /home/runner/theos
+          JOBS: 4
+        run: |
+          set +e
+          bash tools/marble-linux-build.sh kernel 2>&1 | tee out-kernel.log
+          rc=$?
+          echo "build script exit: $rc"
+          ls -l out/linux-build/ || true
+          exit 0
+
+      - name: Surface the diagnostics
+        if: always()
+        working-directory: marble
+        run: |
+          echo "===== out/linux-build ====="
+          ls -l out/linux-build/ 2>/dev/null || true
+          if [ -f out/linux-build/kernel.log ]; then
+            echo "===== kernel.log: errors ====="
+            grep -n -E 'error:|Undefined symbols|ld: |linker command failed|fatal error' out/linux-build/kernel.log | head -60 || true
+            echo "===== kernel.log: tail ====="
+            tail -40 out/linux-build/kernel.log
+          fi
+          echo "===== setup log tail ====="
+          tail -20 out-setup.log 2>/dev/null || true
+          echo done
+
+      - name: Collect the artifacts
+        if: always()
+        run: |
+          mkdir -p dist
+          cp marble/out/linux-build/mach.marble-source dist/ 2>/dev/null || true
+          cp marble/out/linux-build/mach.json dist/ 2>/dev/null || true
+          cp marble/out/linux-build/kernel.log dist/ 2>/dev/null || true
+          cp marble/out/linux-build/kernel.syms dist/ 2>/dev/null || true
+          cp marble/out-setup.log dist/ 2>/dev/null || true
+          cp marble/out-kernel.log dist/ 2>/dev/null || true
+          ls -l dist
+
+      - name: Upload the artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-touch-kernel
+          path: dist
+          if-no-files-found: warn
+          retention-days: 14
