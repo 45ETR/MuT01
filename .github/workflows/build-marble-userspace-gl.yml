@@ -1,0 +1,138 @@
+name: build-marble-userspace-gl
+
+# Builds the GL=1 user-space pieces of yukoimi/hackios-marble on a Linux runner:
+#   libOSMesa.8.dylib   Mesa 25.0.7 (softpipe + freedreno) for iOS, tools/mk-mesa.sh
+#   libredwood-gl.dylib the EAGL/OpenGL ES shim CoreAnimation talks to, userland/src/eagl.c
+# Both end up in the redwood support volume (lib/), which the payload carries; with gl=1 the
+# window server then draws through the phone's GPU instead of failing to make a context.
+#
+# The tree's own recipe only; no source is modified here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      drivers:
+        description: 'gallium drivers (softpipe,freedreno)'
+        required: false
+        default: 'softpipe,freedreno'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout the marble tree
+        uses: actions/checkout@v4
+        with:
+          repository: yukoimi/hackios-marble
+          path: marble
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl clang lld llvm python3 python3-venv python3-pip \
+            flex bison m4 pkg-config libxml2-dev libssl-dev cmake ninja-build meson \
+            rsync zlib1g-dev libzstd-dev uuid-dev libbsd-dev gawk xz-utils patch ca-certificates
+          meson --version
+          ninja --version
+          python3 --version
+          for t in llvm-ar llvm-ranlib llvm-strip; do
+            p=$(command -v $t || true)
+            if [ -z "$p" ]; then
+              p=$(ls /usr/lib/llvm-*/bin/$t 2>/dev/null | head -1)
+              [ -z "$p" ] || sudo ln -sf "$p" /usr/local/bin/$t
+            fi
+            command -v $t
+          done
+
+      - name: Prepare Theos and the toolchain
+        working-directory: marble
+        env:
+          THEOS: /home/runner/theos
+        run: |
+          mkdir -p "$THEOS"
+          bash tools/marble-linux-build.sh setup 2>&1 | tee out-setup.log || {
+            echo "===== setup failed, tail ====="
+            tail -60 out-setup.log
+            exit 1
+          }
+
+      - name: Build Mesa
+        working-directory: marble
+        env:
+          THEOS: /home/runner/theos
+        run: |
+          export DRIVERS="${{ inputs.drivers }}"
+          export PATH="$THEOS/toolchain/linux/iphone/bin:$PATH"
+          for t in llvm-strip install_name_tool nm; do command -v $t; done || true
+          set +e
+          bash tools/mk-mesa.sh 2>&1 | tee out-mesa.log
+          echo "mk-mesa exit: $?"
+          ls -l xnu-deps/build/mesa/out/ 2>/dev/null || true
+          exit 0
+
+      - name: Build the EAGL shim
+        working-directory: marble
+        env:
+          THEOS: /home/runner/theos
+        run: |
+          set +e
+          export PATH="$THEOS/toolchain/linux/iphone/bin:$PATH"
+          source ./xnu-env.sh
+          SDK="$THEOS/sdks/iPhoneOS16.5.sdk"
+          M=xnu-deps/build/mesa/out
+          mkdir -p obj userland/obj
+          if [ ! -f "$M/gl.xml" ] || [ ! -f "$M/exported-gl.txt" ] || [ ! -f "$M/libOSMesa.8.dylib" ]; then
+            echo "mesa outputs missing; skipping the shim"
+            ls -l "$M" || true
+            exit 0
+          fi
+          ( cd userland && python3 mkeagl.py src/eagl_slots.txt \
+              "../$M/gl.xml" "../$M/exported-gl.txt" src/eagl.c > obj/eagl_gen.h ) 2>&1 | tee out-eagl.log
+          xnu-clang -arch arm64 -isysroot "$SDK" -O1 \
+            -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib \
+            -Iuserland/obj -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc \
+            "$M/libOSMesa.8.dylib" -o obj/libredwood-gl.dylib \
+            userland/src/eagl.c userland/src/gl_osmesa.c 2>&1 | tee -a out-eagl.log
+          echo "eagl exit: $?"
+          ls -l obj/ 2>/dev/null || true
+          exit 0
+
+      - name: Surface the diagnostics
+        if: always()
+        working-directory: marble
+        run: |
+          for f in out-mesa.log out-eagl.log; do
+            echo "===== $f: errors ====="
+            grep -n -E 'error:|ERROR:|fatal error|ninja: build stopped|meson.build:[0-9]+:' "$f" 2>/dev/null | head -40 || true
+            echo "===== $f: tail ====="
+            tail -25 "$f" 2>/dev/null || true
+          done
+          echo "===== meson setup log ====="
+          tail -30 xnu-deps/build/mesa/meson-setup.log 2>/dev/null || true
+          echo "===== ninja log ====="
+          head -40 xnu-deps/build/mesa/ninja.log 2>/dev/null || true
+          echo "===== outputs ====="
+          ls -l xnu-deps/build/mesa/out obj 2>/dev/null || true
+          echo done
+
+      - name: Collect the artifacts
+        if: always()
+        run: |
+          mkdir -p dist
+          M=marble/xnu-deps/build/mesa/out
+          cp "$M/libOSMesa.8.dylib" dist/ 2>/dev/null || true
+          cp "$M/exported-gl.txt" dist/ 2>/dev/null || true
+          cp "$M/gl.xml" dist/ 2>/dev/null || true
+          cp marble/obj/libredwood-gl.dylib dist/ 2>/dev/null || true
+          cp marble/out-mesa.log marble/out-eagl.log dist/ 2>/dev/null || true
+          cd dist && ls -l && sha256sum * 2>/dev/null | head -20
+
+      - name: Upload the artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-userspace-gl
+          path: dist/
+          if-no-files-found: warn
