@@ -59,7 +59,13 @@ jobs:
           set -euxo pipefail
           brew install sevenzip zstd
           7zz | head -2
-          python3 -m pip install --quiet cryptography
+          # aea-key.py needs cryptography; Homebrew's python refuses a system-wide install (PEP 668), so
+          # give it a venv and put that venv first in PATH (every later python3 must be this one).
+          python3 -m venv "$HOME/venv"
+          "$HOME/venv/bin/pip" install --quiet --upgrade pip
+          "$HOME/venv/bin/pip" install --quiet cryptography
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+          "$HOME/venv/bin/python3" -c 'import cryptography; print("cryptography", cryptography.__version__)'
           aea 2>&1 | head -5 || true
 
       - name: Download the three disk images
