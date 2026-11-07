@@ -108,11 +108,37 @@ jobs:
           q.write_text(t.replace(old2, new2, 1))
           print('instrumented RedwoodGPUUserClient')
 
+          # 3b. Marble's EPSS block is at 0x17d91000, not redwood's 0x18591000
+          #     (the tree's own marble_cpu_probe() checks for exactly 0x17d91000).
+          #     Writing the wrong block is a hang, so also refuse a table that does
+          #     not look like a frequency table before any register write.
+          c = pathlib.Path('xnu/files/bsd/dev/redwood_cpufreq.c')
+          s2 = c.read_text()
+          oldb = '#define EPSS_PHYS               0x18591000UL'
+          newb = '#define EPSS_PHYS               0x17d91000UL'
+          if oldb not in s2:
+              sys.exit('EPSS_PHYS: pattern not found')
+          s2 = s2.replace(oldb, newb, 1)
+
+          oldg = ("\twas = *(volatile uint32_t *)(base + EPSS_PERF_STATE);\n"
+                  "\t*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;")
+          newg = ("\tif (top == 0 || top_khz < 200000 || top_khz > 4000000) {\n"
+                  "\t\ttell(\"cpufreq: group %u table looks wrong (top %u, %u kHz); no writes\\n\", domain, top, top_khz);\n"
+                  "\t\treturn;\n"
+                  "\t}\n"
+                  "\twas = *(volatile uint32_t *)(base + EPSS_PERF_STATE);\n"
+                  "\t*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;")
+          if oldg not in s2:
+              sys.exit('raise_domain write: pattern not found')
+          c.write_text(s2.replace(oldg, newg, 1))
+          print('pointed EPSS at 0x17d91000 and guarded the write')
+
           # 4. If a build tree is already present, setup will not re-copy xnu/files.
           tree = pathlib.Path('xnu-src/xnu-8796.121.2')
           if tree.is_dir():
               shutil.copyfile(p, tree / 'bsd/dev/marble_adreno.c')
               shutil.copyfile(q, tree / 'iokit/Kernel/RedwoodGPU.cpp')
+              shutil.copyfile(c, tree / 'bsd/dev/redwood_cpufreq.c')
               print('copied the patched files into the existing build tree')
           PY
 
