@@ -91,9 +91,17 @@ jobs:
           print('platform_private.h: marble present')
           PY
 
-      - name: Fetch xnu-12377 and apply the HackiOS work
+      - name: Install the build tools
         run: |
           set -e
+          brew list make >/dev/null 2>&1 || brew install make
+          echo "/opt/homebrew/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
+          /opt/homebrew/opt/make/libexec/gnubin/gmake --version | head -1
+          echo "MAKE=gmake" >> "$GITHUB_ENV"
+
+      - name: Fetch xnu-12377 and apply the HackiOS work
+        run: |
+          set -e -o pipefail
           cd tree
           # Some of the shipped patches carry hunk headers whose line counts are stale (the work was edited
           # after the patch was cut); --recount makes git recalculate them instead of refusing the patch.
@@ -105,27 +113,28 @@ jobs:
 
       - name: Stage the macOS dependencies
         run: |
-          set -e
+          set -e -o pipefail
           cd tree
           bash xnu26/deps-macos.sh --stage1
 
       - name: Export the kernel headers
         run: |
-          set -e
+          set -e -o pipefail
           cd tree
-          bash xnu26/build-macos.sh exporthdrs installhdrs 2>&1 | tail -20
+          bash xnu26/build-macos.sh exporthdrs installhdrs 2>&1 | tail -30
+          ls -d xnu-src/xnu-12377.121.6/BUILD/obj/*/ 2>/dev/null || echo "no BUILD/obj yet"
 
       - name: Stage the kernel libraries
         run: |
-          set -e
+          set -e -o pipefail
           cd tree
           bash xnu26/deps-macos.sh --stage2
 
       - name: Build the kernel
         run: |
-          set -e
+          set -e -o pipefail
           cd tree
-          bash xnu26/build-macos.sh 2>&1 | tail -40
+          bash xnu26/build-macos.sh 2>&1 | tail -60
           ls -l out || true
 
       - name: Build the loader
