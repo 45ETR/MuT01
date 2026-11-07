@@ -98,6 +98,7 @@ jobs:
           echo "/opt/homebrew/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
           /opt/homebrew/opt/make/libexec/gnubin/gmake --version | head -1
           echo "MAKE=gmake" >> "$GITHUB_ENV"
+          echo "MAKEJOBS=-j4" >> "$GITHUB_ENV"
 
       - name: Fetch xnu-12377 and apply the HackiOS work
         run: |
@@ -119,9 +120,19 @@ jobs:
 
       - name: Export the kernel headers
         run: |
-          set -e -o pipefail
+          set -eo pipefail
           cd tree
-          bash xnu26/build-macos.sh exporthdrs installhdrs 2>&1 | tail -30
+          mkdir -p logs
+          bash xnu26/build-macos.sh exporthdrs installhdrs > logs/exporthdrs.log 2>&1 || {
+            echo "===== exporthdrs failed; the commands that ran:"
+            grep -n 'gmake\|/usr/bin/make\|XCRUN' logs/exporthdrs.log | tail -20
+            echo "===== the lines before the usage text:"
+            grep -n -B12 -A2 'This program built for' logs/exporthdrs.log | head -60
+            echo "===== the first errors:"
+            grep -n -m5 -E 'error|Error|No rule|not found' logs/exporthdrs.log | head -20
+            exit 1
+          }
+          tail -5 logs/exporthdrs.log
           ls -d xnu-src/xnu-12377.121.6/BUILD/obj/*/ 2>/dev/null || echo "no BUILD/obj yet"
 
       - name: Stage the kernel libraries
@@ -132,9 +143,15 @@ jobs:
 
       - name: Build the kernel
         run: |
-          set -e -o pipefail
+          set -eo pipefail
           cd tree
-          bash xnu26/build-macos.sh 2>&1 | tail -60
+          mkdir -p logs
+          bash xnu26/build-macos.sh > logs/kernel.log 2>&1 || {
+            echo "===== the kernel build failed; the first errors:"
+            grep -n -m10 -E ': error:|Error [0-9]|No rule|not found' logs/kernel.log | head -30
+            exit 1
+          }
+          tail -5 logs/kernel.log
           ls -l out || true
 
       - name: Build the loader
@@ -158,8 +175,7 @@ jobs:
           mkdir -p upload
           cp -v tree/out/xnu12377-*.bin upload/ 2>/dev/null || true
           cp -v tree/xnuloader/loader-marble.efi upload/ 2>/dev/null || true
-          (cd tree && find . -name 'kernel.log' -o -name '*.log' | head -20) > /tmp/logs.txt || true
-          cat /tmp/logs.txt || true
+          cp -v tree/logs/*.log upload/ 2>/dev/null || true
           ls -l upload
 
       - name: Upload the kernel
