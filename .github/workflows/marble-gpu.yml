@@ -1,10 +1,11 @@
 name: build-marble-touch-kernel
 
-# Builds yukoimi/hackios-marble's source kernel (marble touch / display / GPU / audio drivers) on a Linux
-# runner, following the tree's own tools/marble-linux-build.sh recipe.
+# Builds yukoimi/hackios-marble's source kernel on a Linux runner, following the
+# tree's own tools/marble-linux-build.sh recipe.
 #
-# The produced mach.marble-source is the XNU binary that carries the marble drivers; it is staged through the
-# normal HackiOS boot chain (Mu-marble.img UEFI + loader.efi + XNUP payload).
+# The patches below go into xnu/files/ BEFORE `setup`, because setup is what copies
+# those files into xnu-src/xnu-8796.121.2 (and the kernel step only runs xnu/apply.sh
+# when that tree is missing, so patching afterwards would change nothing).
 
 on:
   workflow_dispatch:
@@ -30,40 +31,51 @@ jobs:
           clang --version
           ld.lld --version
 
-      - name: Prepare Theos and the toolchain
-        working-directory: marble
-        env:
-          THEOS: /home/runner/theos
-        run: |
-          mkdir -p "$THEOS"
-          bash tools/marble-linux-build.sh setup 2>&1 | tee out-setup.log || {
-            echo "===== setup failed, tail ====="
-            tail -60 out-setup.log
-            exit 1
-          }
-
-      - name: Patch the GPU readiness test
+      - name: Patch the sources
         working-directory: marble
         run: |
           set -e
           python3 - <<'PY'
-          import pathlib, sys
+          import pathlib, shutil, sys
+
+          # 1. The service stays ready once it has been started: runtime_inflight is 0
+          #    whenever the GPU is idle, and that is exactly when a client asks.
           p = pathlib.Path('xnu/files/bsd/dev/marble_adreno.c')
           s = p.read_text()
           old = 'bool marble_gpu_ready(void)\n{return __atomic_load_n(&service_started,__ATOMIC_ACQUIRE) && __atomic_load_n(&runtime_inflight,__ATOMIC_ACQUIRE);}'
           new = ('bool marble_gpu_ready(void)\n'
-                 '{/* the service stays ready once started: runtime_inflight is 0 whenever the\n'
-                 '  * GPU is idle, and the user client (Mesa freedreno) is opened exactly then. */\n'
-                 ' return __atomic_load_n(&service_started,__ATOMIC_ACQUIRE) && !__atomic_load_n(&runtime_stop_requested,__ATOMIC_ACQUIRE);}')
+                 '{return __atomic_load_n(&service_started,__ATOMIC_ACQUIRE) && !__atomic_load_n(&runtime_stop_requested,__ATOMIC_ACQUIRE);}')
           if old not in s:
               sys.exit('marble_gpu_ready: pattern not found')
-          p.write_text(s.replace(old, new, 1))
-          print('patched marble_gpu_ready')
+          s = s.replace(old, new, 1)
 
-          # And say, in the log, whether a program was even given a client.
+          # 2. The ladder runs in a kernel thread, so the IOKit service appears long after
+          #    SpringBoard asks for its OpenGL ES context, and Mesa keeps softpipe for the
+          #    life of that process. The start must not return before the service exists.
+          old3 = ("        if(kernel_thread_start(marble_runtime_thread,NULL,&worker)!=KERN_SUCCESS) {\n"
+                  "            __atomic_store_n(&runtime_inflight,0,__ATOMIC_RELEASE);\n"
+                  "            marble_gpu_log(\"marble-gpu-runtime: worker creation failed\\n\");\n"
+                  "        } else thread_deallocate(worker);")
+          new3 = ("        if(kernel_thread_start(marble_runtime_thread,NULL,&worker)!=KERN_SUCCESS) {\n"
+                  "            __atomic_store_n(&runtime_inflight,0,__ATOMIC_RELEASE);\n"
+                  "            marble_gpu_log(\"marble-gpu-runtime: worker creation failed\\n\");\n"
+                  "        } else {\n"
+                  "            unsigned waited=0;\n"
+                  "            for(;waited<3000;waited++) {\n"
+                  "                if(__atomic_load_n(&service_started,__ATOMIC_ACQUIRE))break;\n"
+                  "                delay(10000);\n"
+                  "            }\n"
+                  "            marble_gpu_log(\"marble-gpu-runtime: waited %u ms for the service\\n\",waited*10);\n"
+                  "            thread_deallocate(worker);\n"
+                  "        }")
+          if old3 not in s:
+              sys.exit('marble_runtime_thread start: pattern not found')
+          p.write_text(s.replace(old3, new3, 1))
+          print('patched marble_gpu_ready and the GPU start wait')
+
+          # 3. Say, in the log, whether a program was given a user client at all.
           q = pathlib.Path('xnu/files/iokit/Kernel/RedwoodGPU.cpp')
           t = q.read_text()
-
           old1 = ("\tif (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {\n"
                   "\t\treturn false;\n"
                   "\t}\n"
@@ -93,36 +105,28 @@ jobs:
                   "\tIOLog(\"RedwoodGPU: a user client is open\\n\");")
           if old2 not in t:
               sys.exit('RedwoodGPUUserClient::start: pattern not found')
-          t = t.replace(old2, new2, 1)
-          q.write_text(t)
+          q.write_text(t.replace(old2, new2, 1))
           print('instrumented RedwoodGPUUserClient')
 
-          # The GPU ladder runs in a kernel thread, so the service appears long after
-          # SpringBoard has asked for its OpenGL ES context, and Mesa keeps softpipe for
-          # the life of that process. The start must not return before the service exists.
-          m = pathlib.Path('xnu/files/bsd/dev/marble_adreno.c')
-          u = m.read_text()
-          old3 = ("        if(kernel_thread_start(marble_runtime_thread,NULL,&worker)!=KERN_SUCCESS) {\n"
-                  "            __atomic_store_n(&runtime_inflight,0,__ATOMIC_RELEASE);\n"
-                  "            marble_gpu_log(\"marble-gpu-runtime: worker creation failed\\n\");\n"
-                  "        } else thread_deallocate(worker);")
-          new3 = ("        if(kernel_thread_start(marble_runtime_thread,NULL,&worker)!=KERN_SUCCESS) {\n"
-                  "            __atomic_store_n(&runtime_inflight,0,__ATOMIC_RELEASE);\n"
-                  "            marble_gpu_log(\"marble-gpu-runtime: worker creation failed\\n\");\n"
-                  "        } else {\n"
-                  "            unsigned waited=0;\n"
-                  "            for(;waited<3000;waited++) {\n"
-                  "                if(__atomic_load_n(&service_started,__ATOMIC_ACQUIRE))break;\n"
-                  "                delay(10000);\n"
-                  "            }\n"
-                  "            marble_gpu_log(\"marble-gpu-runtime: waited %u ms for the service\\n\",waited*10);\n"
-                  "            thread_deallocate(worker);\n"
-                  "        }")
-          if old3 not in u:
-              sys.exit('marble_runtime_thread start: pattern not found')
-          m.write_text(u.replace(old3, new3, 1))
-          print('made the GPU start wait for its service')
+          # 4. If a build tree is already present, setup will not re-copy xnu/files.
+          tree = pathlib.Path('xnu-src/xnu-8796.121.2')
+          if tree.is_dir():
+              shutil.copyfile(p, tree / 'bsd/dev/marble_adreno.c')
+              shutil.copyfile(q, tree / 'iokit/Kernel/RedwoodGPU.cpp')
+              print('copied the patched files into the existing build tree')
           PY
+
+      - name: Prepare Theos and the toolchain
+        working-directory: marble
+        env:
+          THEOS: /home/runner/theos
+        run: |
+          mkdir -p "$THEOS"
+          bash tools/marble-linux-build.sh setup 2>&1 | tee out-setup.log || {
+            echo "===== setup failed, tail ====="
+            tail -60 out-setup.log
+            exit 1
+          }
 
       - name: Build the kernel
         working-directory: marble
