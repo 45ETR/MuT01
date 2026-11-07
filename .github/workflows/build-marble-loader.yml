@@ -1,0 +1,76 @@
+name: build-marble-loader
+
+# Builds yukoimi/hackios-marble's freestanding AArch64 UEFI loader (xnuloader/loader.c).
+# That loader is the only one that reports the marble capabilities the kernel and
+# tools/marble-run.py expect: marble-source-kernel, marble-smp, marble-thermal, the
+# EFI input mailbox and the Goodix touch SPI emulation. It is also the only one that
+# prints esr/elr/far when the kernel dies before the panic screen exists.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  loader:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the marble handoff tree
+        uses: actions/checkout@v4
+        with:
+          repository: yukoimi/hackios-marble
+          ref: codex/marble-port
+          fetch-depth: 1
+
+      - name: Install clang and lld
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils
+          clang --version | head -1
+          lld-link --version | head -1
+
+      - name: Build the loader
+        run: |
+          set -o pipefail
+          set +e
+          ( cd xnuloader && bash build.sh ) 2>&1 | tee /tmp/loader.log
+          echo "build.sh exit: ${PIPESTATUS[0]}"
+          set -e
+          echo '--- loader candidates:'
+          find . -name 'loader.efi' -printf '%10s %p\n' || true
+          echo '--- tail of the build log:'
+          tail -30 /tmp/loader.log || true
+
+      - name: Show the capabilities the loader advertises
+        run: |
+          f=$(find . -name 'loader.efi' -printf '%s %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
+          echo "loader: $f"
+          ls -l "$f"; sha256sum "$f"
+          echo '--- capability tokens:'
+          strings -a "$f" | grep -aoE 'marble-[a-z0-9,.-]+' | sort -u | head -40 || true
+          echo '--- early exception reporter:'
+          strings -a "$f" | grep -aiE 'EARLY KERNEL|esr|elr|fault' | head -20 || true
+          echo '--- marble strings:'
+          strings -a "$f" | grep -ai 'marble' | head -30 || true
+
+      - name: Collect the artifacts
+        if: always()
+        run: |
+          mkdir -p out
+          find . -name 'loader.efi' -exec cp {} out/ \;
+          cp /tmp/loader.log out/ 2>/dev/null || true
+          ls -l out
+          echo done
+
+      - name: Upload the loader
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-loader
+          path: out
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### marble loader" >> $GITHUB_STEP_SUMMARY
+          ls -l out >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
