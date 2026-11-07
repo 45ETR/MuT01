@@ -1,0 +1,114 @@
+name: Build the iOS 26 root filesystem (23G90)
+
+# Extracts the iOS 26.6.2 (23G90, iPhone 17: iPhone18,3) userland out of the IPSW on a macOS runner:
+# the root filesystem and the OS cryptex are AEA encrypted, which only macOS can decrypt (aea + hdiutil).
+# The result is uploaded as a few zstd tarballs for the marble port to consume.
+
+on:
+  workflow_dispatch:
+
+env:
+  IPSW_URL: https://updates.cdn-apple.com/2026SummerFCS/c2f9fa07-0acc-4038-99f4-d7a4b1ac9c06/iPhone18,3_26.6.2_23G90_Restore.ipsw
+  IPSW_SIZE: "11481186987"
+
+jobs:
+  fetch:
+    runs-on: macos-26
+    timeout-minutes: 350
+    steps:
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          for c in "/Applications/Xcode_26.6.app" "/Applications/Xcode.app"; do
+            if [ -d "$c" ]; then echo "DEVELOPER_DIR=$c/Contents/Developer" >> "$GITHUB_ENV"; break; fi
+          done
+          xcrun --sdk macosx --show-sdk-path >/dev/null
+
+      - name: Check out the K90 tools
+        uses: actions/checkout@v4
+        with:
+          repository: iola1999/hackios-redmi-k90-annibale
+          ref: main
+          path: work
+          sparse-checkout: |
+            tools
+          sparse-checkout-cone-mode: true
+
+      - name: Check out the K90 userland
+        uses: actions/checkout@v4
+        with:
+          repository: iola1999/hackios-xnu-userland
+          ref: k90-port
+          path: userland-work
+          sparse-checkout: |
+            ios26
+            ios165
+            tools
+          sparse-checkout-cone-mode: true
+
+      - name: Lay the tree out the way fetch.sh expects it
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/ios26"
+          rsync -a work/ "$HOME/ios26/"
+          rsync -a userland-work/ "$HOME/ios26/userland/"
+          ls -l "$HOME/ios26/tools/ipsw" "$HOME/ios26/userland/ios26"
+
+      - name: Install tools
+        run: |
+          set -euxo pipefail
+          brew install sevenzip zstd
+          7zz | head -2
+          python3 -m pip install --quiet cryptography
+          aea 2>&1 | head -5 || true
+
+      - name: Download the three disk images
+        run: |
+          set -euxo pipefail
+          cd "$HOME/ios26"
+          mkdir -p ipsw
+          python3 tools/ipsw/fetch.py 094-96558-090.dmg.aea ipsw/os.dmg.aea       "$IPSW_URL" "$IPSW_SIZE"
+          python3 tools/ipsw/fetch.py 094-95851-092.dmg.aea ipsw/systemos.dmg.aea "$IPSW_URL" "$IPSW_SIZE"
+          python3 tools/ipsw/fetch.py 094-96441-094.dmg     ipsw/appos.dmg        "$IPSW_URL" "$IPSW_SIZE"
+          ls -l ipsw
+
+      - name: Decrypt the AEA images
+        run: |
+          set -euxo pipefail
+          cd "$HOME/ios26"
+          for n in os systemos; do
+            key=$(python3 tools/ipsw/aea-key.py "ipsw/$n.dmg.aea")
+            echo "the key of $n.dmg.aea: ${key:0:16}..."
+            aea decrypt -i "ipsw/$n.dmg.aea" -o "ipsw/$n.dmg" -key-value "base64:$key"
+          done
+          ls -l ipsw
+
+      - name: Lay out the userland
+        run: |
+          set -euxo pipefail
+          cd "$HOME/ios26/userland/ios26"
+          IPSW_DIR="$HOME/ios26/ipsw" bash ./fetch.sh
+          du -sh rootfs cryptex cryptex-app 23G90__iPhone18,3
+          ls -l 23G90__iPhone18,3/dyld_shared_cache_arm64e
+          ls -l rootfs/sbin/launchd rootfs/usr/lib/dyld rootfs/System/Library/dyld 2>/dev/null | head -20
+
+      - name: Pack it up
+        run: |
+          set -euxo pipefail
+          cd "$HOME/ios26/userland/ios26"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          for d in rootfs cryptex cryptex-app 23G90__iPhone18,3; do
+            tar -cf - "$d" | zstd -T0 -3 -o "$GITHUB_WORKSPACE/out/$(echo "$d" | tr ',' '_').tar.zst"
+          done
+          cp -a system.files system.manifest var.skel "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          ls -l "$GITHUB_WORKSPACE/out"
+          cd "$GITHUB_WORKSPACE/out"
+          ls -l > listing.txt
+
+      - name: Upload the parts
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-ios26-rootfs
+          path: out
+          compression-level: 0
+          retention-days: 14
