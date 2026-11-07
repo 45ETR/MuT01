@@ -1,0 +1,158 @@
+name: Build the iOS 26 (xnu-12377) kernel for marble
+# Builds the HackiOS xnu-12377 (iOS 26) kernel for the REDMI Note 12 Turbo with the K90 tree
+# (iola1999/hackios-xnu-kernel, branch k90-port) plus marble's platform description.
+on:
+  workflow_dispatch:
+    inputs:
+      xcode:
+        description: "Xcode version to select; empty means the newest installed"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      XNU_ROOT: ${{ github.workspace }}/tree
+    steps:
+      - name: Select Xcode
+        run: |
+          set -e
+          want="${{ inputs.xcode }}"
+          if [ -n "$want" ] && [ -d "/Applications/Xcode_$want.app" ]; then
+            echo "DEVELOPER_DIR=/Applications/Xcode_$want.app/Contents/Developer" >> "$GITHUB_ENV"
+          else
+            pick=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+            echo "DEVELOPER_DIR=$pick/Contents/Developer" >> "$GITHUB_ENV"
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Check out the K90 tree
+        uses: actions/checkout@v4
+        with:
+          repository: iola1999/hackios-xnu-kernel
+          ref: k90-port
+          path: tree
+          fetch-depth: 1
+          submodules: false
+
+      - name: Add marble
+        run: |
+          set -e
+          mkdir -p tree/common/devices
+          cat > tree/common/devices/marble.conf <<'CONF'
+          NAME="REDMI Note 12 Turbo / POCO F5 (marble)"
+          KIND=phone
+          SOC="Qualcomm SM7475 (Snapdragon 7+ Gen 2)"
+          UEFI_TARGET=marble
+          UEFI_FD=
+          DTB=
+          FD_BASE=0xA7100000
+          FD_SIZE=0x300000
+          PAYLOAD_BASE=0xAA000000
+          PAYLOAD_CAP=0x03700000
+          FB_BASE=0xB8000000
+          LOADER_CFLAGS=""
+          WIFI_ATH11K=0
+          BOOTARGS="touchscreen=0 cpus=8"
+          DEFAULT_SECS=900
+          USERLAND_VARS=""
+          FIRMWARE=""
+          CONF
+          python3 - <<'PY'
+          p = 'tree/xnuloader/platform_private.h'
+          s = open(p).read()
+          if 'platform_marble' not in s:
+              entry = '''
+          /*
+           * marble (REDMI Note 12 Turbo / POCO F5, SM7475): GIC 0x17100000 + redistributor 0x17180000
+           * (2 MiB, 0x40000 stride), eight cores 0..700, four A510 small cores, GOP splash 0xB8000000.
+           */
+          static const struct platform platform_marble = {
+          \t.name = "marble", .io_base = 0x00400000, .io_size = 0x3FC00000,
+          \t.gic_dist = 0x17100000, .gic_redist = 0x17180000,
+          \t.gic_redist_size = 0x200000, .gic_redist_stride = 0x40000,
+          \t.uart = 0, .log_other_cpu = 1,
+          \t.cores = 8, .core_mpidr = {0, 0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700},
+          \t.small_cores = 0x0f,
+          \t.fb_base = 0xB8000000,
+          };
+          '''.replace('\\t', '\t')
+              anchor = '\n/*\n * The devices the loader knows'
+              assert anchor in s
+              s = s.replace(anchor, entry + anchor, 1)
+              s = s.replace('\t&platform_annibale,\n};', '\t&platform_annibale,\n\t&platform_marble,\n};', 1)
+              open(p, 'w').write(s)
+          print('platform_private.h: marble present')
+          PY
+
+      - name: Fetch xnu-12377 and apply the HackiOS work
+        run: |
+          set -e
+          cd tree
+          bash xnu26/apply.sh
+          echo "--- patches applied:"
+          wc -l < xnu26/patches/series
+
+      - name: Stage the macOS dependencies
+        run: |
+          set -e
+          cd tree
+          bash xnu26/deps-macos.sh --stage1
+
+      - name: Export the kernel headers
+        run: |
+          set -e
+          cd tree
+          bash xnu26/build-macos.sh exporthdrs installhdrs 2>&1 | tail -20
+
+      - name: Stage the kernel libraries
+        run: |
+          set -e
+          cd tree
+          bash xnu26/deps-macos.sh --stage2
+
+      - name: Build the kernel
+        run: |
+          set -e
+          cd tree
+          bash xnu26/build-macos.sh 2>&1 | tail -40
+          ls -l out || true
+
+      - name: Build the loader
+        run: |
+          set -e
+          cd tree/xnuloader
+          brew list llvm >/dev/null 2>&1 || brew install llvm >/dev/null
+          export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
+          clang --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector \
+            -fshort-wchar -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter \
+            -c loader.c -o loader.obj
+          lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 \
+            /out:loader-marble.efi loader.obj
+          ls -l loader-marble.efi
+          strings -a loader-marble.efi | grep -c marble || true
+
+      - name: Collect the artifacts
+        if: always()
+        run: |
+          set -e
+          mkdir -p upload
+          cp -v tree/out/xnu12377-*.bin upload/ 2>/dev/null || true
+          cp -v tree/xnuloader/loader-marble.efi upload/ 2>/dev/null || true
+          (cd tree && find . -name 'kernel.log' -o -name '*.log' | head -20) > /tmp/logs.txt || true
+          cat /tmp/logs.txt || true
+          ls -l upload
+
+      - name: Upload the kernel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-ios26-kernel
+          path: upload
+          if-no-files-found: warn
