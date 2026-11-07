@@ -42,6 +42,25 @@ jobs:
             exit 1
           }
 
+      - name: Patch the GPU readiness test
+        working-directory: marble
+        run: |
+          set -e
+          python3 - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path('xnu/files/bsd/dev/marble_adreno.c')
+          s = p.read_text()
+          old = 'bool marble_gpu_ready(void)\n{return __atomic_load_n(&service_started,__ATOMIC_ACQUIRE) && __atomic_load_n(&runtime_inflight,__ATOMIC_ACQUIRE);}'
+          new = ('bool marble_gpu_ready(void)\n'
+                 '{/* the service stays ready once started: runtime_inflight is 0 whenever the\n'
+                 '  * GPU is idle, and the user client (Mesa freedreno) is opened exactly then. */\n'
+                 ' return __atomic_load_n(&service_started,__ATOMIC_ACQUIRE) && !__atomic_load_n(&runtime_stop_requested,__ATOMIC_ACQUIRE);}')
+          if old not in s:
+              sys.exit('marble_gpu_ready: pattern not found')
+          p.write_text(s.replace(old, new, 1))
+          print('patched marble_gpu_ready')
+          PY
+
       - name: Build the kernel
         working-directory: marble
         env:
