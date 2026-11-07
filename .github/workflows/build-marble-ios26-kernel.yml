@@ -163,23 +163,29 @@ jobs:
         run: |
           set -eo pipefail
           brew list llvm >/dev/null 2>&1 || brew install llvm
-          export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-          ls /opt/homebrew/opt/llvm/bin | grep -E '^(clang|lld|lld-link|ld64.lld)' || true
-          which clang lld-link ld64.lld || true
+          LLVM_BIN="$(brew --prefix llvm)/bin"
+          echo "arch: $(uname -m)"
+          echo "llvm bin: $LLVM_BIN"
+          ls "$LLVM_BIN" | grep -E '^(clang|lld|lld-link|ld64.lld)' || true
+          CC="$LLVM_BIN/clang"
+          if [ -x "$LLVM_BIN/lld-link" ]; then
+            LINK="$LLVM_BIN/lld-link"
+          elif [ -x "$LLVM_BIN/ld64.lld" ]; then
+            LINK="$LLVM_BIN/ld64.lld -flavor link"
+          elif [ -x "$LLVM_BIN/lld" ]; then
+            LINK="$LLVM_BIN/lld -flavor link"
+          else
+            echo "no lld in $LLVM_BIN; here is what is there:"
+            ls -l "$LLVM_BIN" | head -60
+            exit 1
+          fi
+          echo "linking with: $LINK"
           cd tree/xnuloader
-          clang --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector \
+          "$CC" --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector \
             -fshort-wchar -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter \
             -c loader.c -o loader.obj
-          if command -v lld-link >/dev/null 2>&1; then
-            lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 \
-              /out:loader-marble.efi loader.obj
-          elif command -v ld64.lld >/dev/null 2>&1; then
-            ld64.lld -flavor link /subsystem:efi_application /entry:efi_main /nodefaultlib \
-              /base:0xA1000000 /out:loader-marble.efi loader.obj
-          else
-            lld -flavor link /subsystem:efi_application /entry:efi_main /nodefaultlib \
-              /base:0xA1000000 /out:loader-marble.efi loader.obj
-          fi
+          $LINK /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 \
+            /out:loader-marble.efi loader.obj
           ls -l loader-marble.efi
           strings -a loader-marble.efi | grep -c marble || true
 
