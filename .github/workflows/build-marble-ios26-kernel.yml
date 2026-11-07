@@ -99,6 +99,11 @@ jobs:
           /opt/homebrew/opt/make/libexec/gnubin/gmake --version | head -1
           echo "MAKE=gmake" >> "$GITHUB_ENV"
           echo "MAKEJOBS=-j4" >> "$GITHUB_ENV"
+          # The tree's Makefile asks `nproc` for the CPU count (xnu26/patches/01-Makefile.patch), which is
+          # a coreutils tool: macOS does not have it, and an empty answer turns MAKEJOBS into a bare --jobs=.
+          printf '#!/bin/sh\nsysctl -n hw.logicalcpu\n' | sudo tee /usr/local/bin/nproc >/dev/null
+          sudo chmod 755 /usr/local/bin/nproc
+          nproc
 
       - name: Fetch xnu-12377 and apply the HackiOS work
         run: |
