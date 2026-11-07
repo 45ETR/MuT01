@@ -161,15 +161,25 @@ jobs:
 
       - name: Build the loader
         run: |
-          set -e
-          cd tree/xnuloader
-          brew list llvm >/dev/null 2>&1 || brew install llvm >/dev/null
+          set -eo pipefail
+          brew list llvm >/dev/null 2>&1 || brew install llvm
           export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
+          ls /opt/homebrew/opt/llvm/bin | grep -E '^(clang|lld|lld-link|ld64.lld)' || true
+          which clang lld-link ld64.lld || true
+          cd tree/xnuloader
           clang --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector \
             -fshort-wchar -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter \
             -c loader.c -o loader.obj
-          lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 \
-            /out:loader-marble.efi loader.obj
+          if command -v lld-link >/dev/null 2>&1; then
+            lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 \
+              /out:loader-marble.efi loader.obj
+          elif command -v ld64.lld >/dev/null 2>&1; then
+            ld64.lld -flavor link /subsystem:efi_application /entry:efi_main /nodefaultlib \
+              /base:0xA1000000 /out:loader-marble.efi loader.obj
+          else
+            lld -flavor link /subsystem:efi_application /entry:efi_main /nodefaultlib \
+              /base:0xA1000000 /out:loader-marble.efi loader.obj
+          fi
           ls -l loader-marble.efi
           strings -a loader-marble.efi | grep -c marble || true
 
