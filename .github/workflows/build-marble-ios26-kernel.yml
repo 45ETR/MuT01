@@ -163,20 +163,23 @@ jobs:
         run: |
           set -eo pipefail
           brew list llvm >/dev/null 2>&1 || brew install llvm
-          LLVM_BIN="$(brew --prefix llvm)/bin"
+          # Homebrew ships the linker in its own formula ("lld"); the llvm one has no lld-link.
+          brew list lld >/dev/null 2>&1 || brew install lld
+          CC="$(brew --prefix llvm)/bin/clang"
+          LLD_BIN="$(brew --prefix lld)/bin"
           echo "arch: $(uname -m)"
-          echo "llvm bin: $LLVM_BIN"
-          ls "$LLVM_BIN" | grep -E '^(clang|lld|lld-link|ld64.lld)' || true
-          CC="$LLVM_BIN/clang"
-          if [ -x "$LLVM_BIN/lld-link" ]; then
-            LINK="$LLVM_BIN/lld-link"
-          elif [ -x "$LLVM_BIN/ld64.lld" ]; then
-            LINK="$LLVM_BIN/ld64.lld -flavor link"
-          elif [ -x "$LLVM_BIN/lld" ]; then
-            LINK="$LLVM_BIN/lld -flavor link"
+          echo "cc: $CC"
+          echo "lld bin: $LLD_BIN"
+          ls -l "$LLD_BIN" || true
+          if [ -x "$LLD_BIN/lld-link" ]; then
+            LINK="$LLD_BIN/lld-link"
+          elif [ -x "$LLD_BIN/ld64.lld" ]; then
+            LINK="$LLD_BIN/ld64.lld -flavor link"
+          elif [ -x "$LLD_BIN/lld" ]; then
+            LINK="$LLD_BIN/lld -flavor link"
           else
-            echo "no lld in $LLVM_BIN; here is what is there:"
-            ls -l "$LLVM_BIN" | head -60
+            echo "no linker in $LLD_BIN; looking wider:"
+            find /opt/homebrew /usr/local -maxdepth 5 -name 'lld-link' -o -maxdepth 5 -name 'ld64.lld' 2>/dev/null | head -20
             exit 1
           fi
           echo "linking with: $LINK"
