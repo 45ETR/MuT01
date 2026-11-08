@@ -11,6 +11,9 @@ env:
   IPSW_URL: https://updates.cdn-apple.com/2026SummerFCS/c2f9fa07-0acc-4038-99f4-d7a4b1ac9c06/iPhone18,3_26.6.2_23G90_Restore.ipsw
   IPSW_SIZE: "11481186987"
 
+permissions:
+  contents: write
+
 jobs:
   fetch:
     runs-on: macos-26
@@ -103,23 +106,59 @@ jobs:
           du -sh ./*/System/Library/dyld 2>/dev/null || true
           echo "----- done"
 
-      - name: Pack it up
+      # Chunks go out as release assets: 2 GiB per asset is allowed there, and
+      # the download is a plain URL instead of a zip-in-a-zip.
+      - name: Trim the obvious bulk
         run: |
           set -euxo pipefail
           cd "$HOME/ios26/userland/ios26"
-          mkdir -p "$GITHUB_WORKSPACE/out"
-          for d in rootfs cryptex cryptex-app 23G90__iPhone18,3; do
-            tar -cf - "$d" | zstd -T0 -3 -o "$GITHUB_WORKSPACE/out/$(echo "$d" | tr ',' '_').tar.zst"
+          echo "----- the root before trimming"
+          du -sh rootfs/* 2>/dev/null | sort -h | tail -15 || true
+          for p in Applications System/Library/Caches System/Library/Developer \
+                   Library/Developer AppleInternal usr/share/doc; do
+            [ -e "rootfs/$p" ] || continue
+            echo "dropping rootfs/$p ($(du -sh "rootfs/$p" | cut -f1))"
+            rm -rf "rootfs/$p"
           done
-          cp -a system.files system.manifest var.skel "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
-          ls -l "$GITHUB_WORKSPACE/out"
-          cd "$GITHUB_WORKSPACE/out"
-          ls -l > listing.txt
+          find rootfs -maxdepth 8 -type d -name '*.symbols' -print -exec rm -rf {} + 2>/dev/null || true
+          echo "----- the root after trimming"
+          du -sh rootfs 23G90__iPhone18,3 cryptex cryptex-app || true
 
-      - name: Upload the parts
-        uses: actions/upload-artifact@v4
-        with:
-          name: marble-ios26-rootfs
-          path: out
-          compression-level: 0
-          retention-days: 14
+      - name: Pack it up into chunks
+        run: |
+          set -euxo pipefail
+          cd "$HOME/ios26/userland/ios26"
+          out="$GITHUB_WORKSPACE/out"
+          mkdir -p "$out"
+          for d in rootfs cryptex cryptex-app 23G90__iPhone18,3; do
+            [ -d "$d" ] || { echo "skipping $d (absent)"; continue; }
+            base=$(echo "$d" | tr -c 'A-Za-z0-9' '_')
+            tar -cf - "$d" | zstd -T0 -3 -o "$out/$base.tar.zst"
+            split -b 1900M -d -a 2 "$out/$base.tar.zst" "$out/$base.tar.zst.part"
+            rm -f "$out/$base.tar.zst"
+          done
+          cp -a system.files system.manifest var.skel "$out/" 2>/dev/null || true
+          cd "$out"
+          ls -l
+          ls -l > listing.txt
+          if command -v sha256sum >/dev/null 2>&1; then HASH="sha256sum"; else HASH="shasum -a 256"; fi
+          $HASH ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the chunks as release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          tag="ios26-rootfs-23G90"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "iOS 26.6.2 (23G90) userland for marble" \
+              --notes "Chunked rootfs for the marble XNU port: cat the .partNN files of one base name back together, then zstd -d."
+          fi
+          shopt -s nullglob
+          for f in "$GITHUB_WORKSPACE"/out/*; do
+            [ -f "$f" ] || continue
+            echo "uploading $(basename "$f") ($(du -h "$f" | cut -f1))"
+            gh release upload "$tag" "$f" --clobber
+          done
+          gh release view "$tag" --json assets --jq '.assets[] | "\(.name) \(.size)"'
