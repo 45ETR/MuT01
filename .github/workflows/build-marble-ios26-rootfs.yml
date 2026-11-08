@@ -94,9 +94,14 @@ jobs:
           set -euxo pipefail
           cd "$HOME/ios26/userland/ios26"
           IPSW_DIR="$HOME/ios26/ipsw" bash ./fetch.sh
-          du -sh rootfs cryptex cryptex-app 23G90__iPhone18,3
-          ls -l 23G90__iPhone18,3/dyld_shared_cache_arm64e
-          ls -l rootfs/sbin/launchd rootfs/usr/lib/dyld rootfs/System/Library/dyld 2>/dev/null | head -20
+          echo "----- sizes (iOS 26 keeps the dyld cache outside the root dmg)"
+          du -sh rootfs cryptex cryptex-app 23G90__iPhone18,3 || true
+          echo "----- the two binaries that matter"
+          ls -l rootfs/sbin/launchd rootfs/usr/lib/dyld || true
+          echo "----- where the shared cache actually is"
+          find . -maxdepth 7 -name 'dyld_shared_cache*' -print 2>/dev/null | head -20 || true
+          du -sh ./*/System/Library/dyld 2>/dev/null || true
+          echo "----- done"
 
       - name: Pack it up
         run: |
