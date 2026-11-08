@@ -148,17 +148,21 @@ jobs:
       - name: Publish the chunks as release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           set -euxo pipefail
+          # the job's working directory is not a checkout, so name the repo explicitly
           tag="ios26-rootfs-23G90"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --title "iOS 26.6.2 (23G90) userland for marble" \
+          if ! gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
+            gh release create "$tag" -R "$REPO" \
+              --title "iOS 26.6.2 (23G90) userland for marble" \
               --notes "Chunked rootfs for the marble XNU port: cat the .partNN files of one base name back together, then zstd -d."
           fi
           shopt -s nullglob
           for f in "$GITHUB_WORKSPACE"/out/*; do
             [ -f "$f" ] || continue
             echo "uploading $(basename "$f") ($(du -h "$f" | cut -f1))"
-            gh release upload "$tag" "$f" --clobber
+            gh release upload "$tag" "$f" -R "$REPO" --clobber
           done
-          gh release view "$tag" --json assets --jq '.assets[] | "\(.name) \(.size)"'
+          gh release view "$tag" -R "$REPO" --json assets \
+            --jq '.assets[] | "\(.name) \(.size)"'
