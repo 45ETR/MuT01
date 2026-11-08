@@ -8,6 +8,13 @@ on:
         description: "Xcode version to select; empty means the newest installed"
         required: false
         default: ""
+      k90_ref:
+        description: "Commit of iola1999/hackios-xnu-kernel to build (a SHA pins the tree)"
+        required: false
+        # 5fbfda6b produced the kernel we are debugging. The branch head (02de166) rewrote
+        # build-macos.sh and its tree no longer compiles the UBSan runtime (san/memory) for
+        # BCM2837, so stay on this SHA until that is fixed upstream.
+        default: "5fbfda6b26c7d9411db11943627a245041d1ca96"
 
 permissions:
   contents: read
@@ -36,10 +43,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: iola1999/hackios-xnu-kernel
-          ref: k90-port
+          ref: ${{ inputs.k90_ref }}
           path: tree
           fetch-depth: 1
           submodules: false
+
+      - name: Report which tree we got
+        run: |
+          set -e
+          cd tree
+          echo "commit: $(git rev-parse HEAD)"
+          git log -1 --format='%h %ad %s' --date=short
+          echo "patches in the series: $(wc -l < xnu26/patches/series)"
+          ls -d xnu xnu26 2>/dev/null || true
 
       - name: Add marble
         run: |
@@ -163,6 +179,12 @@ jobs:
           cd tree/xnu-src/xnu-12377.121.6
           python3 /tmp/bringup.py
           grep -c 'loader_checkpoint([0-9]' osfmk/kern/startup.c
+          echo "===== the UBSan runtime, in case the build dies in san/memory:"
+          wc -l san/memory/ubsan_minimal.c san/memory/ubsan_minimal.h
+          grep -rn 'UBSAN_MINIMAL_TRAPS_START\|UBSAN_TRAPS_PER_CLASS\|CA_UBSANBUF_LEN' \
+            san osfmk bsd 2>/dev/null | head -12 || true
+          echo "===== ubsan options:"
+          grep -rn 'UBSAN' ../../xnu26/files/config/MASTER.arm64.bcm2837 2>/dev/null | head -5 || true
 
       - name: Build the kernel
         run: |
