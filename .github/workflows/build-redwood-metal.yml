@@ -50,13 +50,18 @@ on:
         description: 'arm64e 编译失败时自动退回 arm64'
         type: boolean
         default: true
+      runner:
+        description: 'runner 标签。macos-14 池子最大、排队最短；macos-latest 可能是最新镜像，排队长'
+        type: choice
+        options: [macos-14, macos-15, macos-latest]
+        default: macos-14
 
 permissions:
   contents: read
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
 
     steps:
