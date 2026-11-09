@@ -456,6 +456,53 @@ jobs:
           grep -n 'marble_adreno_init' bsd/dev/redwood_adreno.c bsd/dev/*/redwood_adreno.c 2>/dev/null || true
           grep -n 'MarbleGPURing' iokit/Kernel/RedwoodGPU.cpp
 
+      - name: Unblock the GMU cold test (the rpmh lease is only a diagnostic)
+        run: |
+          set -e -o pipefail
+          cd tree/xnu-src/xnu-12377.121.6
+          python3 - <<'PY'
+          def read(p): return open(p, encoding='utf-8').read()
+          def write(p, s): open(p, 'w', encoding='utf-8').write(s)
+
+          p = 'bsd/dev/marble_adreno.c'
+          s = read(p)
+
+          # 8a) The rpmh snapshot refuses before it reads a single register, so
+          #     record the exact state it is refusing on: TCS idle bit, IRQ and
+          #     the 0x14 command register (plus the TCM guard result).
+          anchor = ('    struct rpmh_device d={device,ml_io_map(MARBLE_RPMH_PHYS,0x100)};if(!d.base)return -1;\n'
+                    '    MarbleRpmhIo io={&d,board_rpmh_read,board_rpmh_write,power_delay,board_rpmh_guard};MarbleRpmhResult r;\n'
+                    '    int passed=marble_rpmh_snapshot(&io,addresses,&r);\n')
+          if 'marble-gmu-rpmh: raw idle=' not in s:
+              if anchor not in s:
+                  raise SystemExit('anchor missing: rpmh snapshot call')
+              repl = ('    struct rpmh_device d={device,ml_io_map(MARBLE_RPMH_PHYS,0x100)};if(!d.base)return -1;\n'
+                      '    marble_gpu_log("marble-gmu-rpmh: raw idle=%#x irq=%#x rc14=%#x guard=%d\\n",'
+                      'power_read((void *)d.base,0x18),power_read((void *)d.base,4),'
+                      'power_read((void *)d.base,0x14),board_rpmh_guard(&d));\n'
+                      '    MarbleRpmhIo io={&d,board_rpmh_read,board_rpmh_write,power_delay,board_rpmh_guard};MarbleRpmhResult r;\n'
+                      '    int passed=marble_rpmh_snapshot(&io,addresses,&r);\n')
+              s = s.replace(anchor, repl, 1)
+
+          # 8b) The rpmh lease and the BCM dependency decode are read-only
+          #     diagnostics; a refusal there must not keep the stage-17 cold
+          #     test (release the GMU reset, run INIT, check HFI) from running.
+          anchor2 = ('    if(!status && probe_stage>=15)status=gmu_rpmh(&device);\n'
+                     '    if(!status && probe_stage>=16)status=gmu_dependencies(&device);\n')
+          if 'continuation status' not in s:
+              if anchor2 not in s:
+                  raise SystemExit('anchor missing: rpmh/dependencies stage calls')
+              repl2 = ('    if(!status && probe_stage>=15){int rpmh_status=gmu_rpmh(&device);'
+                       'marble_gpu_log("marble-gmu-rpmh: continuation status=%d\\n",rpmh_status);}\n'
+                       '    if(!status && probe_stage>=16){int dep_status=gmu_dependencies(&device);'
+                       'marble_gpu_log("marble-gmu-dependencies: continuation status=%d\\n",dep_status);}\n')
+              s = s.replace(anchor2, repl2, 1)
+          write(p, s)
+          print('diag: rpmh raw state recorded; rpmh/dependencies no longer block the cold test')
+          PY
+          grep -n 'rpmh: raw idle' bsd/dev/marble_adreno.c
+          grep -n 'continuation status' bsd/dev/marble_adreno.c
+
       - name: Build the kernel
         run: |
           set -eo pipefail
