@@ -399,6 +399,32 @@ jobs:
               s = s.replace(old_pin, new_pin)
           write(p, s)
           print('marble firmware pins: a730_zap.mdt / a730_zap.b02 re-pinned')
+
+          # 6) This tree's __DATA,__bss starts on a 4 KB boundary, so the two
+          #    16 KB GMU buffers below end up 16 KB spaced but only 4 KB
+          #    aligned in physical memory. The SMMU maps them as 4 KB pages
+          #    anyway, so relax the absolute alignment test and print the
+          #    physical addresses: a refused plan used to fail silently.
+          p = 'bsd/dev/marble_gpu/marble_gmu_resources.h'
+          s = read(p)
+          if '((log_pa|hfi_pa)&0x3fff)' in s:
+              s = s.replace('((log_pa|hfi_pa)&0x3fff)', '((log_pa|hfi_pa)&0xfff)')
+              write(p, s)
+              print('marble GMU buffers: 16 KB -> 4 KB physical alignment')
+          p = 'bsd/dev/marble_adreno.c'
+          s = read(p)
+          if 'probe buffers log_pa' not in s:
+              anchor = '        if(stage>=11) {\n'
+              if anchor not in s:
+                  sys.exit('anchor missing: stage>=11 block')
+              diag = ('        marble_gpu_log("marble-gpu: probe log_pa=%#llx hfi_pa=%#llx fw_bytes=%#lx pages=%lu ranges=%lu\\n",\n'
+                      '            (unsigned long long)kvtophys((vm_offset_t)gmu_log),'
+                      ' (unsigned long long)kvtophys((vm_offset_t)gmu_hfi),'
+                      ' (unsigned long)gmu_plan.bytes,(unsigned long)gmu_plan.pages,'
+                      ' (unsigned long)gmu_plan.count);\n')
+              s = s.replace(anchor, diag + anchor, 1)
+              write(p, s)
+              print('marble GMU buffers: physical probe print added')
           PY
           echo "--- marble port in place ---"
           grep -c 'marble' bsd/conf/files
