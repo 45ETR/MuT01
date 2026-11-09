@@ -425,6 +425,31 @@ jobs:
               s = s.replace(anchor, diag + anchor, 1)
               write(p, s)
               print('marble GMU buffers: physical probe print added')
+
+          # 7) Both buffers carry a 16 KB alignment attribute, so the compiler
+          #    legitimately folds `gmu_log + 0x1000` into `orr base, #0x1000`.
+          #    In this image they are only 4 KB aligned, which makes the OR a
+          #    no-op and the contiguity check impossible to pass - it returned
+          #    0 silently. Route the base through a volatile pointer so the
+          #    compiler has to emit a real add, and say so when it passes.
+          p = 'bsd/dev/marble_adreno.c'
+          s = read(p)
+          old = ('            for(unsigned i=0;i<0x4000;i+=4096)\n'
+                 '                if(kvtophys((vm_offset_t)gmu_log+i)!=log_pa+i'
+                 ' || kvtophys((vm_offset_t)gmu_hfi+i)!=hfi_pa+i)return 0;\n')
+          new = ('            /* the buffers are only 4 KB aligned here: base+i must stay an add */\n'
+                 '            { volatile vm_offset_t b_log=(vm_offset_t)gmu_log,b_hfi=(vm_offset_t)gmu_hfi;\n'
+                 '              for(unsigned i=0;i<0x4000;i+=4096)\n'
+                 '                if(kvtophys(b_log+i)!=log_pa+i || kvtophys(b_hfi+i)!=hfi_pa+i)return 0;\n'
+                 '              marble_gpu_log("marble-gpu: log/hfi buffers contiguous\\n"); }\n')
+          if old not in s:
+              sys.exit('anchor missing: contiguity loop')
+          s = s.replace(old, new, 1)
+          write(p, s)
+          print('marble GMU buffers: contiguity test forced to runtime adds')
+          s = read(p)
+          if 'buffers contiguous' not in s:
+              sys.exit('contiguity patch did not land')
           PY
           echo "--- marble port in place ---"
           grep -c 'marble' bsd/conf/files
