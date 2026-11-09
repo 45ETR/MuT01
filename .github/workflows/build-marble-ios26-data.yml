@@ -2,9 +2,10 @@ name: Build a writable APFS data volume for marble
 
 # Our root image is made by mkapfs.py, which has no space manager, so APFS mounts it read-only.
 # iOS needs a writable /private/var (fixup-mobile-tmp, keybag, usermanagerd, coredumps, swap files),
-# and only macOS can create a real APFS container. This job makes one with hdiutil (which formats it
-# properly), fills in the /private/var skeleton, copies the raw container out of the attached device
-# and publishes it. The loader turns it into md1.
+# and only macOS can create a real APFS container. The job formats an image with hdiutil, copies the
+# raw container out of the (never mounted) block device and publishes it; the loader turns it into md1.
+# Nothing is mounted on purpose: mounting a fresh APFS volume on a runner tends to sit in Spotlight's
+# hands, and launchd creates the /private/var contents itself once the volume is writable.
 
 on:
   workflow_dispatch:
@@ -20,64 +21,38 @@ permissions:
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 40
+    timeout-minutes: 15
     steps:
       - name: Show the APFS tooling
         run: |
           set -euxo pipefail
           which hdiutil diskutil newfs_apfs
-          hdiutil 2>&1 | head -5 || true
-          newfs_apfs 2>&1 | head -25 || true
+          newfs_apfs 2>&1 | head -20 || true
 
-      - name: Create a blank writable APFS image
+      - name: Format a blank writable APFS container
         run: |
           set -euxo pipefail
           SIZE_MB='${{ inputs.size_mb }}'
           [ -n "$SIZE_MB" ] || SIZE_MB=1024
           IMG="$RUNNER_TEMP/vol.dmg"
           rm -f "$IMG"
-          # one shot: a read/write image formatted as APFS with a single volume named Data.
-          # -layout NONE keeps the container at offset zero, exactly like the root image.
+          # a read/write image formatted as APFS, container at offset zero (like our root image)
           hdiutil create -size "${SIZE_MB}m" -fs APFS -volname Data -layout NONE -type UDIF -ov "$IMG"
-          hdiutil imageinfo "$IMG" | sed -n '1,25p'
           echo "IMG=$IMG" >> "$GITHUB_ENV"
+          ls -l "$IMG"
+          hdiutil imageinfo "$IMG" | sed -n '1,20p' || true
 
-      - name: Fill in the /private/var skeleton
-        run: |
-          set -euxo pipefail
-          IMG="$IMG"
-          MNT="$RUNNER_TEMP/mnt"
-          mkdir -p "$MNT"
-          hdiutil attach "$IMG" -nobrowse -mountpoint "$MNT"
-          sudo chown -R 0:0 "$MNT"
-          for d in mobile mobile/Library mobile/Library/Caches mobile/Library/Preferences \
-                   mobile/Media mobile/Documents mobile/Downloads \
-                   db db/DarwinDirectory db/com.apple.xpc.launchd db/dslocal \
-                   tmp logs Keychains folders preferences cores audit containers devices; do
-            sudo mkdir -p "$MNT/$d"
-          done
-          sudo chown 501:501 "$MNT/mobile"
-          sudo chown -R 501:501 "$MNT/mobile"
-          sudo chmod 1777 "$MNT/tmp"
-          sudo chmod 755 "$MNT"
-          ls -la "$MNT" | head -25
-          du -sh "$MNT" || true
-          sync
-          hdiutil detach "$MNT"
-          diskutil list | tail -20
-
-      - name: Copy the raw container out of the device
+      - name: Copy the raw container out of the block device
         run: |
           set -euxo pipefail
           IMG="$IMG"
           DEV=$(hdiutil attach -nomount -nobrowse "$IMG" | awk 'NR==1 {print $1}')
-          echo "attached as $DEV"
+          echo "attached as $DEV (not mounted)"
           diskutil list "$DEV" || true
-          hdiutil pmap "$IMG" | head -20 || true
           N=${DEV#/dev/}
           RAW="$RUNNER_TEMP/data.raw"
           found=""
-          # the container may sit on the whole device or on a partition slice: look for NXSB
+          # the container may sit on the whole device or on a partition slice: look for NXSB at offset 32
           for cand in "/dev/r$N" "/dev/r${N}s1" "/dev/r${N}s2" "/dev/r${N}s3"; do
             [ -e "$cand" ] || continue
             mag=$(sudo dd if="$cand" bs=1 skip=32 count=4 2>/dev/null | xxd -p | head -1 || true)
