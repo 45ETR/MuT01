@@ -51,21 +51,25 @@ jobs:
           diskutil list "$DEV" || true
           N=${DEV#/dev/}
           RAW="$RUNNER_TEMP/data.raw"
-          found=""
-          # the container may sit on the whole device or on a partition slice: look for NXSB at offset 32
-          for cand in "/dev/r$N" "/dev/r${N}s1" "/dev/r${N}s2" "/dev/r${N}s3"; do
+          pick=""
+          # -layout NONE puts the container at offset zero; the slices are only a fallback.
+          # dd needs a block-aligned read, so copy the device and look at the copy.
+          CAND_WHOLE="/dev/r${N}"
+          CAND_S1="/dev/r${N}s1"
+          CAND_S2="/dev/r${N}s2"
+          for cand in "$CAND_WHOLE" "$CAND_S1" "$CAND_S2"; do
             [ -e "$cand" ] || continue
-            mag=$(sudo dd if="$cand" bs=1 skip=32 count=4 2>/dev/null | xxd -p | head -1 || true)
-            echo "candidate $cand magic=$mag"
-            if [ "$mag" = "4e585342" ] && [ -z "$found" ]; then found="$cand"; fi
+            sudo dd if="$cand" of="$RAW" bs=1m status=none || true
+            mag=$(xxd -p -l 4 -s 32 "$RAW" 2>/dev/null | head -1 || true)
+            echo "candidate $cand -> magic $mag"
+            if [ "$mag" = "4e585342" ]; then pick="$cand"; break; fi
           done
-          if [ -z "$found" ]; then
+          if [ -z "$pick" ]; then
             echo "no APFS container on $DEV"
             sudo hexdump -C -n 128 "/dev/r$N" || true
             exit 1
           fi
-          echo "copying $found"
-          sudo dd if="$found" of="$RAW" bs=1m
+          echo "copied from $pick"
           hdiutil detach "$DEV" -force || true
           ls -l "$RAW"
           xxd -l 48 "$RAW"
