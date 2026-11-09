@@ -42,8 +42,12 @@ jobs:
           DEV=$(hdiutil attach -nomount -nobrowse "$IMG" | awk 'NR==1 {print $1}')
           echo "attached as $DEV (not mounted)"
           diskutil list "$DEV" || true
-          # Role D = Data.  Without a role the iOS apfs driver mounts the volume read-only.
-          sudo newfs_apfs -v Data -r D "$DEV"
+          # Role D = Data (-R, not -r: -r is the volume reserve).  Without a role the iOS apfs
+          # driver mounts the volume read-only.  -D is the other spelling some builds accept.
+          if ! sudo newfs_apfs -v Data -R D "$DEV"; then
+            echo "newfs_apfs -R D failed, retrying with -D"
+            sudo newfs_apfs -v Data -D "$DEV"
+          fi
           N=${DEV#/dev/}
           RAW="$RUNNER_TEMP/data.raw"
           pick=""
