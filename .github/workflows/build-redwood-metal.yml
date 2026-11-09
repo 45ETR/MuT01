@@ -1,0 +1,336 @@
+# 构建 RedwoodMetal —— iOS 26 的 Metal 插件（RedwoodGPU 的用户态驱动）
+#
+# 为什么要在 macOS runner 上跑：iOS 26 的进程是 arm64e，只有 Apple 的 clang 能出 arm64e，
+# 而它只在 Xcode 里。Linux 上的 xnu-clang / Theos 只能出 arm64。
+#
+# 仓库里必须有这些文件（从 hackios-xnu-kernel 仓库的 userland/src/ 原样搬）：
+#     userland/src/redwoodmetal.m        (6333 行，已把全部 .inc 合并进来的那份)
+#     userland/src/redwooddrawable.m
+#     userland/src/redwood_drawable.h
+#     userland/src/metal_props.c
+#     userland/src/metal_plugin.plist
+#     userland/src/metal_drv_test.m      (可选：验证工具)
+#     tools/apfs/mkapfs.py               (可选：打 /redwood 卷)
+#
+# 注意：不要用 k90-hackios-xnu-userland 里 src/gfx/ 那份 5609 行的 redwoodmetal.m ——
+# 那份是 iOS 16.5 的，靠 #include 一堆 .inc，且不含 26 线的改动。
+#
+# 产出：
+#     redwood-metal-<arch>.tar.gz    lib/ + bin/ 的完整树，直接铺到 /redwood
+#     redwood.apfs                    可挂到 /redwood 的单卷镜像（make_apfs=true 时）
+#
+# 装上之后的运行条件（workflow 不管这些，但少一条 Metal 都找不到设备）：
+#     1. 内核带 metal=1 启动
+#     2. /redwood/lib/RedwoodMetal.bundle 存在
+#     3. /System/Library/Extensions/RedwoodMetal.bundle 指向它（软链，或改名绕路径）
+#     4. 有进程调用 metal_props on，把两个属性写到 IOAcceleratorES 上：
+#        MetalPluginName=RedwoodMetal  MetalPluginClassName=RedwoodMetalDevice
+
+name: build-redwood-metal
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: '切片架构（iOS 26 用户态是 arm64e；arm64 只是退路）'
+        type: choice
+        options: [arm64e, arm64]
+        default: arm64e
+      min_ios:
+        description: '最低 iOS 版本，会被夹到本机 SDK 版本（不会超过它）'
+        default: '26.0'
+      make_apfs:
+        description: '额外打一个能挂到 /redwood 的 APFS 卷'
+        type: boolean
+        default: true
+      source_dir:
+        description: '源码目录（含 redwoodmetal.m 的那层）'
+        default: 'userland/src'
+      allow_arch_fallback:
+        description: 'arm64e 编译失败时自动退回 arm64'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 取源码
+        uses: actions/checkout@v4
+
+      - name: 环境
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner : $(uname -m) / $(sw_vers -productVersion)"
+          xcodebuild -version | sed 's/^/xcode  : /'
+          echo "ios sdk: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "sdk dir: $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      - name: 检查源码是否齐
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ inputs.source_dir }}"
+          need="redwoodmetal.m redwooddrawable.m redwood_drawable.h metal_props.c metal_plugin.plist"
+          miss=""
+          for f in $need; do
+            [ -f "$SRC/$f" ] || miss="$miss $f"
+          done
+          if [ -n "$miss" ]; then
+            echo "::error::$SRC 里缺:$miss"
+            echo "把这些文件从 hackios-xnu-kernel 的 userland/src/ 搬进仓库再跑。"
+            echo "当前 $SRC 有什么："
+            ls -la "$SRC" 2>/dev/null || echo "  (目录不存在)"
+            exit 1
+          fi
+          echo "源码目录 $SRC 齐了。"
+          wc -l "$SRC/redwoodmetal.m" "$SRC/redwooddrawable.m"
+          # 5609 行那份是 16.5 的，靠 include 分片；26 线是单文件 6333 行
+          lines=$(wc -l < "$SRC/redwoodmetal.m")
+          if [ "$lines" -lt 6000 ]; then
+            echo "::warning::redwoodmetal.m 只有 $lines 行，看着像 iOS 16.5 的 src/gfx 版本（5609 行），不是 26 线的单文件版（6333 行）。继续编，但产物可能不对。"
+          fi
+
+      - name: 编译
+        id: compile
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SRC="${{ inputs.source_dir }}"
+          ARCH="${{ inputs.arch }}"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SDKVER="$(xcrun --sdk iphoneos --show-sdk-version)"
+
+          # 部署目标不能超过本机 SDK，否则 clang 直接报 "invalid iOS deployment version"
+          MIN="$(printf '%s\n%s\n' "${{ inputs.min_ios }}" "$SDKVER" | sort -V | head -1)"
+
+          # 新 clang 把这几个从警告升成了错误；源码是手写 objc_msgSend 的，会踩到。
+          # 只降级、不隐藏（真正的 error 照样 fail）。
+          WARN="-Wno-error=implicit-function-declaration
+                -Wno-error=incompatible-pointer-types
+                -Wno-error=int-conversion
+                -Wno-deprecated-declarations
+                -Wno-nullability-completeness"
+
+          # 与 userland/build.sh 一字不差的编译选项
+          COMMON="-framework Foundation -framework IOKit -framework Metal -lobjc"
+
+          mkdir -p out/lib/RedwoodMetal.bundle out/bin
+
+          # 用子 shell 包住：函数出现在 if 的条件里时 set -e 会失效，
+          # 那样第一条编译失败还会继续往下走。子 shell 让失败如实冒出来。
+          build_group() {
+            local arch="$1"
+            (
+              set -euo pipefail
+              cc="xcrun --sdk iphoneos clang -arch $arch -miphoneos-version-min=$MIN -isysroot $SDK -O1 -I$SRC"
+
+              echo "== 用 $arch 编（min iOS $MIN / SDK $SDKVER）"
+              rm -rf out/lib out/bin
+              mkdir -p out/lib/RedwoodMetal.bundle out/bin
+
+              $cc $WARN -dynamiclib -install_name /redwood/lib/libredwoodmetal.dylib \
+                $COMMON -o out/lib/libredwoodmetal.dylib \
+                "$SRC/redwoodmetal.m" "$SRC/redwooddrawable.m"
+
+              $cc $WARN -bundle $COMMON \
+                -o out/lib/RedwoodMetal.bundle/RedwoodMetal \
+                "$SRC/redwoodmetal.m" "$SRC/redwooddrawable.m"
+
+              $cc $WARN -framework CoreFoundation -framework IOKit \
+                -o out/bin/metal_props "$SRC/metal_props.c"
+
+              cp "$SRC/metal_plugin.plist" out/lib/RedwoodMetal.bundle/Info.plist
+
+              if [ -f "$SRC/metal_drv_test.m" ]; then
+                $cc $WARN $COMMON -o out/bin/metal_drv_test "$SRC/metal_drv_test.m" \
+                  || echo "::warning::metal_drv_test 编不过（不阻塞）"
+              fi
+
+              # 整条链的验收：不手load 我们的库，直接问 MTLCreateSystemDefaultDevice()
+              if [ -f "$SRC/metal_test.m" ]; then
+                $cc $WARN -fobjc-arc -framework Foundation -framework CoreGraphics \
+                  -framework CoreImage -framework IOKit -framework Metal -framework OpenGLES \
+                  -lMobileGestalt -o out/bin/metal_test "$SRC/metal_test.m" \
+                  || echo "::warning::metal_test 编不过（不阻塞）"
+              fi
+
+              # ad-hoc 签名：真机 AMFI 在这套移植里是关的，但不签会在某些路径上多一层噪音
+              for f in out/lib/libredwoodmetal.dylib out/lib/RedwoodMetal.bundle/RedwoodMetal out/bin/*; do
+                codesign --force --sign - --timestamp=none "$f" 2>/dev/null || true
+              done
+            )
+          }
+
+          ARCH_USED=""
+          if build_group "$ARCH"; then
+            ARCH_USED="$ARCH"
+          elif [ "${{ inputs.allow_arch_fallback }}" = "true" ] && [ "$ARCH" != "arm64" ]; then
+            echo "::warning::$ARCH 编不过，退回 arm64（arm64e 进程能加载 arm64 dylib，但 PAC 路径不同，真机风险更高）"
+            build_group arm64
+            ARCH_USED="arm64"
+          else
+            echo "::error::编译失败"
+            exit 1
+          fi
+
+          echo "ARCH_OK=$ARCH_USED" >> "$GITHUB_ENV"
+          echo "arch=$ARCH_USED" >> "$GITHUB_OUTPUT"
+          ls -la out/lib out/lib/RedwoodMetal.bundle out/bin
+
+      - name: 验证产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUM="$GITHUB_STEP_SUMMARY"
+          DYLIB=out/lib/libredwoodmetal.dylib
+          BUNDLE=out/lib/RedwoodMetal.bundle/RedwoodMetal
+          PLIST=out/lib/RedwoodMetal.bundle/Info.plist
+          fail=0
+
+          {
+            echo "## RedwoodMetal 构建结果"
+            echo
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| runner 架构 | \`$ARCH_OK\` |"
+            echo "| SDK | \`$(xcrun --sdk iphoneos --show-sdk-version)\` |"
+            echo "| dylib 大小 | \`$(stat -f%z "$DYLIB")\` B |"
+            echo "| bundle 可执行 | \`$(stat -f%z "$BUNDLE")\` B |"
+            echo
+          } >> "$SUM"
+
+          echo "--- 1. 架构 ---"
+          for f in "$DYLIB" "$BUNDLE" out/bin/metal_props; do
+            printf '  %-10s %s\n' "$(lipo -archs "$f")" "$f"
+          done
+
+          echo "--- 2. install_name（必须是 /redwood/lib/libredwoodmetal.dylib） ---"
+          otool -D "$DYLIB"
+
+          echo "--- 3. 依赖 ---"
+          otool -L "$DYLIB"
+          otool -L "$BUNDLE"
+
+          echo "--- 4. 导出的驱动类（Metal 用它按 MetalPluginClassName 找） ---"
+          nm -gU "$BUNDLE" | grep -F '_OBJC_CLASS_$_RedwoodMetalDevice' || {
+            echo "::error::bundle 里没有 _OBJC_CLASS_$_RedwoodMetalDevice，Metal 的 classNamed: 会拿到 nil"
+            fail=1
+          }
+
+          echo "--- 5. 私有基类 _MTLDevice 是未定义符号（从 Metal.framework 绑定） ---"
+          nm -u "$BUNDLE" | grep -F '_OBJC_CLASS_$__MTLDevice' || {
+            echo "::error::没有 _OBJC_CLASS_$__MTLDevice 引用，说明没真的继承 Apple 的私有基类"
+            fail=1
+          }
+
+          echo "--- 6. Info.plist 与实际可执行名一致 ---"
+          plutil -p "$PLIST"
+          EXEC_NAME="$(plutil -extract CFBundleExecutable raw "$PLIST" || echo '?')"
+          PRINC="$(plutil -extract NSPrincipalClass raw "$PLIST" || echo '?')"
+          echo "CFBundleExecutable = $EXEC_NAME / NSPrincipalClass = $PRINC"
+          [ "$EXEC_NAME" = "RedwoodMetal" ] || { echo "::error::CFBundleExecutable 不是 RedwoodMetal"; fail=1; }
+          [ -f "out/lib/RedwoodMetal.bundle/$EXEC_NAME" ] || { echo "::error::bundle 里没有名为 $EXEC_NAME 的文件"; fail=1; }
+
+          echo "--- 7. 驱动找的 GPU 服务名 ---"
+          strings "$BUNDLE" | grep -i -m5 'RedwoodGPU' || echo "(没找到 RedwoodGPU 字样，检查源码版本)"
+
+          echo "--- 8. metal_props 的默认属性值 ---"
+          strings out/bin/metal_props | grep -E 'RedwoodMetal|MetalPlugin' | head -10 || true
+
+          {
+            echo "### otool -D (install_name)"
+            echo '```'
+            otool -D "$DYLIB"
+            echo '```'
+            echo "### otool -L (dylib)"
+            echo '```'
+            otool -L "$DYLIB"
+            echo '```'
+            echo "### 导出类"
+            echo '```'
+            nm -gU "$BUNDLE" | grep -F 'RedwoodMetalDevice' || true
+            echo '```'
+            echo "### Info.plist"
+            echo '```'
+            plutil -p "$PLIST"
+            echo '```'
+          } >> "$SUM"
+
+          [ "$fail" = 0 ] || { echo "::error::验证没过，见上面"; exit 1; }
+
+      - name: 打 tar 包
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH="$ARCH_OK"
+          tar -C out -czf "out/redwood-metal-$ARCH.tar.gz" lib bin
+          ls -la out/
+          echo "--- 包内 ---"
+          tar -tzf "out/redwood-metal-$ARCH.tar.gz"
+
+      - name: 打 APFS 卷（挂 /redwood 用）
+        if: ${{ inputs.make_apfs }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MK=""
+          for c in tools/apfs/mkapfs.py mkapfs.py ../tools/apfs/mkapfs.py; do
+            if [ -f "$c" ]; then MK="$c"; break; fi
+          done
+          if [ -z "$MK" ]; then
+            echo "::warning::仓库里没有 mkapfs.py，跳过 APFS 卷（tar 包照样能用）"
+            exit 0
+          fi
+
+          # 卷内布局与 build.sh 的 root/ 一致：/redwood 下就是 lib/ 和 bin/
+          rm -rf stage && mkdir -p stage
+          cp -a out/lib out/bin stage/
+          # mkapfs 从 st_mode 取权限位，cp -a 保住了 0755
+
+          python3 "$MK" -z -o out/redwood.apfs redwood=stage
+          ls -la out/redwood.apfs
+          echo "卷内文件数: $(find stage -type f | wc -l)"
+
+      - name: 上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: redwood-metal-${{ steps.compile.outputs.arch }}
+          path: |
+            out/redwood-metal-*.tar.gz
+            out/redwood.apfs
+            out/lib/**
+            out/bin/**
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 用法写进 summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo
+            echo "## 拿到之后怎么装"
+            echo
+            echo '```'
+            echo "# 1. 铺到 /redwood（tar 包解到根就是 /redwood/lib 和 /redwood/bin）"
+            echo "tar -xzf redwood-metal-*.tar.gz -C /redwood"
+            echo
+            echo "# 2. 让 Metal 的固定路径指到它"
+            echo "ln -sf /redwood/lib/RedwoodMetal.bundle /System/Library/Extensions/RedwoodMetal.bundle"
+            echo
+            echo "# 3. 内核必须带 metal=1 启动，然后打开两个属性"
+            echo "/redwood/bin/metal_props on"
+            echo "/redwood/bin/metal_props show     # 期望 RedwoodMetal / RedwoodMetalDevice"
+            echo '```'
+            echo
+            echo "判定成功：IOMFB 内核日志出现 swap，且 Metal 侧 MTLCreateSystemDefaultDevice() 返回非 nil。"
+            echo "仍无 swap 时先看 metal_props show 有没有值，再看 /System/Library/Extensions/RedwoodMetal.bundle 是否解到。"
+          } >> "$GITHUB_STEP_SUMMARY"
