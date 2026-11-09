@@ -1,0 +1,115 @@
+name: Build a writable APFS data volume for marble
+
+# Our root image is made by mkapfs.py, which has no space manager, so APFS mounts it read-only.
+# iOS needs a writable /private/var (fixup-mobile-tmp, keybag, usermanagerd, coredumps, swap files),
+# and only macOS can create a real APFS container. This job builds a small writable container with a
+# single volume whose role is Data, pre-populated with the /private/var skeleton, and publishes it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: 'Size of the data volume in MB'
+        required: false
+        default: '512'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          for c in "/Applications/Xcode_26.6.app" "/Applications/Xcode.app"; do
+            if [ -d "$c" ]; then echo "DEVELOPER_DIR=$c/Contents/Developer" >> "$GITHUB_ENV"; break; fi
+          done
+          xcrun --sdk macosx --show-sdk-path >/dev/null
+
+      - name: Show the APFS tools
+        run: |
+          set -euxo pipefail
+          which newfs_apfs diskutil hdiutil
+          newfs_apfs 2>&1 | head -20 || true
+          diskutil apfs addVolume 2>&1 | head -10 || true
+
+      - name: Create a writable APFS container with a Data volume
+        run: |
+          set -euxo pipefail
+          SIZE_MB='${{ inputs.size_mb }}'
+          [ -n "$SIZE_MB" ] || SIZE_MB=512
+          RAW="$RUNNER_TEMP/data.raw"
+          # a sparse file that will hold the raw APFS container
+          mkfile -n "${SIZE_MB}m" "$RAW"
+          DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$RAW" | awk 'NR==1 {print $1}')
+          echo "attached as $DEV"
+          echo "DEV=$DEV" >> "$GITHUB_ENV"
+          newfs_apfs -v Data "$DEV"
+          diskutil list "$DEV"
+
+      - name: Mount it and lay out /private/var
+        run: |
+          set -euxo pipefail
+          DEV="$DEV"
+          MNT="$RUNNER_TEMP/mnt"
+          mkdir -p "$MNT"
+          sudo diskutil mount -mountPoint "$MNT" "${DEV}s1"
+          sudo chown -R 0:0 "$MNT"
+          for d in mobile mobile/tmp mobile/Library mobile/Library/Caches mobile/Media mobile/Documents \
+                   mobile/Downloads mobile/Library/Preferences db db/DarwinDirectory \
+                   db/com.apple.xpc.launchd db/dslocal tmp logs Keychains folders preferences \
+                   cores audit containers devices; do
+            sudo mkdir -p "$MNT/$d"
+          done
+          sudo chown 501:501 "$MNT/mobile"
+          sudo chown -R 501:501 "$MNT/mobile"
+          sudo chmod 1777 "$MNT/tmp"
+          sudo chmod 755 "$MNT"
+          echo "----- the skeleton"
+          ls -la "$MNT" | head -30
+          du -sh "$MNT"
+          sync
+          sudo diskutil unmount "$MNT"
+
+      - name: Detach and pack the raw container
+        run: |
+          set -euxo pipefail
+          DEV="$DEV"
+          hdiutil detach "$DEV" -force || true
+          RAW="$RUNNER_TEMP/data.raw"
+          ls -l "$RAW"
+          out="$GITHUB_WORKSPACE/out"
+          mkdir -p "$out"
+          # it is mostly zeros: zstd crushes it, and the loader writes the image into RAM anyway
+          zstd -T0 -9 "$RAW" -o "$out/data.apfs.zst"
+          split -b 900M -d -a 2 "$out/data.apfs.zst" "$out/data.apfs.zst.part"
+          rm -f "$out/data.apfs.zst"
+          cd "$out"
+          ls -l
+          if command -v sha256sum >/dev/null 2>&1; then HASH="sha256sum"; else HASH="shasum -a 256"; fi
+          $HASH ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish it as release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euxo pipefail
+          tag="ios26-apfs-data"
+          if ! gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
+            gh release create "$tag" -R "$REPO" \
+              --title "Writable APFS data volume for marble" \
+              --notes "A raw APFS container with one Data-role volume; cat data.apfs.zst.part* | zstd -d > data.raw"
+          fi
+          shopt -s nullglob
+          for f in "$GITHUB_WORKSPACE"/out/*; do
+            [ -f "$f" ] || continue
+            echo "uploading $(basename "$f") ($(du -h "$f" | cut -f1))"
+            gh release upload "$tag" "$f" -R "$REPO" --clobber
+          done
+          gh release view "$tag" -R "$REPO" --json assets \
+            --jq '.assets[] | "\(.name) \(.size)"'
