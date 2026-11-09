@@ -1,11 +1,12 @@
 name: Build a writable APFS data volume for marble
 
 # Our root image is made by mkapfs.py, which has no space manager, so APFS mounts it read-only.
-# iOS needs a writable /private/var (fixup-mobile-tmp, keybag, usermanagerd, coredumps, swap files),
-# and only macOS can create a real APFS container. The job formats an image with hdiutil, copies the
-# raw container out of the (never mounted) block device and publishes it; the loader turns it into md1.
-# Nothing is mounted on purpose: mounting a fresh APFS volume on a runner tends to sit in Spotlight's
-# hands, and launchd creates the /private/var contents itself once the volume is writable.
+# iOS needs a writable /private/var (fixup-mobile-tmp, keybag, usermanagerd, coredumps, swap files).
+# The kernel mounts md1 there, and measurement showed it *does* mount - but read-only, because the
+# volume carries no role ("the volume is iOS's own system or preboot volume" is one of the reasons
+# apfs_write_volume_ok() reports EROFS).  So this job formats the container with newfs_apfs and gives
+# the volume the Data role, then copies the raw container out of the (never mounted) block device.
+# Keep it small: the loader only accepts a 57.6 MB payload, so md1 has to fit next to the kernel.
 
 on:
   workflow_dispatch:
@@ -13,7 +14,7 @@ on:
       size_mb:
         description: 'Size of the data volume in MB'
         required: false
-        default: '1024'
+        default: '24'
 
 permissions:
   contents: write
@@ -29,35 +30,26 @@ jobs:
           which hdiutil diskutil newfs_apfs
           newfs_apfs 2>&1 | head -20 || true
 
-      - name: Format a blank writable APFS container
+      - name: Format a Data-role APFS container and copy it out
         run: |
           set -euxo pipefail
           SIZE_MB='${{ inputs.size_mb }}'
-          [ -n "$SIZE_MB" ] || SIZE_MB=1024
+          [ -n "$SIZE_MB" ] || SIZE_MB=24
           IMG="$RUNNER_TEMP/vol.dmg"
           rm -f "$IMG"
-          # a read/write image formatted as APFS, container at offset zero (like our root image)
-          hdiutil create -size "${SIZE_MB}m" -fs APFS -volname Data -layout NONE -type UDIF -ov "$IMG"
-          echo "IMG=$IMG" >> "$GITHUB_ENV"
-          ls -l "$IMG"
-          hdiutil imageinfo "$IMG" | sed -n '1,20p' || true
-
-      - name: Copy the raw container out of the block device
-        run: |
-          set -euxo pipefail
-          IMG="$IMG"
+          # A blank read/write image; the container is created by newfs_apfs, which can set the role.
+          hdiutil create -size "${SIZE_MB}m" -layout NONE -type UDIF -ov "$IMG"
           DEV=$(hdiutil attach -nomount -nobrowse "$IMG" | awk 'NR==1 {print $1}')
           echo "attached as $DEV (not mounted)"
           diskutil list "$DEV" || true
+          # Role D = Data.  Without a role the iOS apfs driver mounts the volume read-only.
+          sudo newfs_apfs -v Data -r D "$DEV"
           N=${DEV#/dev/}
           RAW="$RUNNER_TEMP/data.raw"
           pick=""
-          # -layout NONE puts the container at offset zero; the slices are only a fallback.
-          # dd needs a block-aligned read, so copy the device and look at the copy.
           CAND_WHOLE="/dev/r${N}"
           CAND_S1="/dev/r${N}s1"
-          CAND_S2="/dev/r${N}s2"
-          for cand in "$CAND_WHOLE" "$CAND_S1" "$CAND_S2"; do
+          for cand in "$CAND_WHOLE" "$CAND_S1"; do
             [ -e "$cand" ] || continue
             sudo dd if="$cand" of="$RAW" bs=1m status=none || true
             mag=$(xxd -p -l 4 -s 32 "$RAW" 2>/dev/null | head -1 || true)
@@ -73,7 +65,7 @@ jobs:
           hdiutil detach "$DEV" -force || true
           ls -l "$RAW"
           xxd -l 48 "$RAW"
-          python3 -c "import struct;d=open('$RAW','rb').read(64);m,b,c=struct.unpack_from('<IIQ',d,32);print('nx_magic %#x block_size %d blocks %d total %.2f GiB' % (m,b,c,b*c/2**30));assert m==0x4253584e,'not an APFS container'"
+          python3 -c "import struct;d=open('$RAW','rb').read(64);m,b,c=struct.unpack_from('<IIQ',d,32);print('nx_magic %#x block_size %d blocks %d total %.2f MiB' % (m,b,c,b*c/2**20));assert m==0x4253584e,'not an APFS container'"
 
       - name: Pack and publish the container
         env:
@@ -96,7 +88,7 @@ jobs:
           if ! gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
             gh release create "$tag" -R "$REPO" \
               --title "Writable APFS data volume for marble" \
-              --notes "A raw APFS container with one volume for /private/var; cat data.apfs.zst.part* | zstd -d > data.raw"
+              --notes "A raw APFS container with one Data-role volume for /private/var; cat data.apfs.zst.part* | zstd -d > data.raw"
           fi
           shopt -s nullglob
           for f in "$out"/*; do
