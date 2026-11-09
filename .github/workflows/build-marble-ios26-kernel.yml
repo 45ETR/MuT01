@@ -15,6 +15,13 @@ on:
         # build-macos.sh and its tree no longer compiles the UBSan runtime (san/memory) for
         # BCM2837, so stay on this SHA until that is fixed upstream.
         default: "5fbfda6b26c7d9411db11943627a245041d1ca96"
+      marble_ref:
+        description: "Commit of yukoimi/hackios-marble to take the marble Adreno 725 GPU/display stack from"
+        required: false
+        # The iOS 16.5 tree that boots this phone with SpringBoard drawing through Mesa on the
+        # Adreno 725 (a730 firmware, Gen7_4_0), including marble_adreno.c, the ArmSmmu4K/Adreno
+        # HFI helpers it builds on, and the MarbleGPURing bridge RedwoodGPU.cpp grows.
+        default: "8e50e532f09b3042165048c3c72e04b5a8e68898"
 
 permissions:
   contents: read
@@ -107,6 +114,46 @@ jobs:
           print('platform_private.h: marble present')
           PY
 
+      - name: Add the marble-gpu device tree node to the loader
+        run: |
+          set -e -o pipefail
+          cd tree
+          python3 - <<'PY'
+          p = 'xnuloader/loader_05_layout_run_kernel.inc'
+          s = open(p, encoding='utf-8').read()
+          if 'marble-gpu' in s:
+              print('the loader already has the node')
+          else:
+              anchor = '\tdt_begin(&w, "gic");\n'
+              if anchor not in s:
+                  raise SystemExit('anchor missing: the gic node')
+              node = (
+                  '\t/* The Adreno 725 node marble_adreno.c looks up, with the windows of this phone. */\n'
+                  '\tif (str_eq(plat->name, "marble")) {\n'
+                  '\t\tdt_begin(&w, "marble-gpu");\n'
+                  '\t\tdt_prop_str(&w, "compatible", "marble,adreno725-preflight-v1");\n'
+                  '\t\tdt_prop_u32(&w, "chip-id", 0x07030002);\n'
+                  '\t\tuint64_t windows[] = {\n'
+                  '\t\t    0x03d00000, 0x40000, 0x03d68000, 0x37000, 0x03d90000, 0xa000,\n'
+                  '\t\t    0x03d50000, 0x10000, 0x03da0000, 0x40000, 0x0b290000, 0x10000,\n'
+                  '\t\t    0x03d40000, 0x10000 };\n'
+                  '\t\tdt_prop(&w, "windows", windows, sizeof(windows));\n'
+                  '\t\tuint64_t tbu[] = { 0x03de6000, 0x20, 0x03de9000, 0x1000, 0x03de6200, 8 };\n'
+                  '\t\tdt_prop(&w, "tbu-windows", tbu, sizeof(tbu));\n'
+                  '\t\tuint64_t cmd_db[] = { 0x80860000, 0x20000 };\n'
+                  '\t\tdt_prop(&w, "cmd-db-window", cmd_db, sizeof(cmd_db));\n'
+                  '\t\tuint64_t rpmh[] = { 0x17a20d00, 0x100 };\n'
+                  '\t\tdt_prop(&w, "rpmh-window", rpmh, sizeof(rpmh));\n'
+                  '\t\tuint64_t boot[] = { 0x03d9e000, 0x1000 };\n'
+                  '\t\tdt_prop(&w, "gmu-boot-window", boot, sizeof(boot));\n'
+                  '\t\tdt_end(&w);\n'
+                  '\t}\n'
+              )
+              s = s.replace(anchor, node + anchor, 1)
+              open(p, 'w', encoding='utf-8').write(s)
+              print('node inserted before the gic node')
+          PY
+          grep -n 'marble-gpu' xnuloader/loader_05_layout_run_kernel.inc
       - name: Install the build tools
         run: |
           set -e
@@ -179,6 +226,113 @@ jobs:
           cd tree/xnu-src/xnu-12377.121.6
           python3 /tmp/bringup.py
           grep -c 'loader_checkpoint([0-9]' osfmk/kern/startup.c
+
+
+      - name: Port the marble GPU stack (Adreno 725) onto the tree
+        run: |
+          set -e -o pipefail
+          MARBLE_REF="${{ inputs.marble_ref }}"
+          echo "hackios-marble ref: $MARBLE_REF"
+          rm -rf /tmp/hm /tmp/hm.tar.gz
+          curl -fsSL --retry 3 -o /tmp/hm.tar.gz "https://codeload.github.com/yukoimi/hackios-marble/tar.gz/$MARBLE_REF"
+          mkdir -p /tmp/hm
+          tar -xzf /tmp/hm.tar.gz -C /tmp/hm --strip-components=1
+          SRC=/tmp/hm/xnu/files
+          ls -l "$SRC/bsd/dev/marble_adreno.c" "$SRC/bsd/dev/marble_smmu.c" "$SRC/iokit/Kernel/MarbleGPURing.inc"
+          cd tree/xnu-src/xnu-12377.121.6
+          cp -v "$SRC/bsd/dev/marble_adreno.c" bsd/dev/
+          cp -v "$SRC/bsd/dev/marble_smmu.c" bsd/dev/
+          rm -rf bsd/dev/marble_gpu
+          mkdir -p bsd/dev/marble_gpu
+          cp -R "$SRC/bsd/dev/marble_gpu/." bsd/dev/marble_gpu/
+          cp -v "$SRC/iokit/Kernel/MarbleGPURing.inc" iokit/Kernel/
+          echo "headers: $(find bsd/dev/marble_gpu -name '*.h' | wc -l)  sources: $(find bsd/dev/marble_gpu -name '*.c' | wc -l)"
+          python3 - <<'PY'
+          import glob, sys
+
+          def read(p): return open(p, encoding='utf-8').read()
+          def write(p, s): open(p, 'w', encoding='utf-8').write(s)
+
+          # 1) bsd/conf/files: the marble sources, the same list the iOS 16.5 tree builds
+          conf = 'bsd/conf/files'
+          s = read(conf)
+          entries = [
+              'bsd/dev/marble_adreno.c',
+              'bsd/dev/marble_smmu.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoPM4.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoFirmware.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoHfi.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoHfiStartup.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoHfiVotes.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4K.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KContext.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KProgram.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KStreams.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KAudit.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KLive.c',
+          ]
+          if 'marble_adreno.c' not in s:
+              s = s.rstrip('\n') + '\n' + ''.join(e + '\tstandard\n' for e in entries)
+              write(conf, s)
+          print('conf/files: marble lines =', sum(1 for l in read(conf).splitlines() if 'marble' in l))
+
+          # 2) redwood_adreno.c: let the marble driver take the GPU on this board
+          cands = glob.glob('bsd/dev/**/redwood_adreno.c', recursive=True)
+          if not cands:
+              sys.exit('no redwood_adreno.c in the tree')
+          p = cands[0]
+          s = read(p)
+          if 'marble_adreno_init' not in s:
+              a_init = 'void\nredwood_adreno_init(void)\n{\n'
+              hook_init = a_init + ('\textern bool marble_adreno_init(void);\n'
+                                    '\tif (marble_adreno_init()) return;\n')
+              if a_init not in s:
+                  sys.exit('anchor missing: redwood_adreno_init')
+              s = s.replace(a_init, hook_init, 1)
+              a_q = 'void\nredwood_adreno_quiesce(void)\n{\n'
+              hook_q = a_q + ('\textern bool marble_adreno_quiesce(void);\n'
+                              '\tif (marble_adreno_quiesce()) return;\n')
+              if a_q in s:
+                  s = s.replace(a_q, hook_q, 1)
+              write(p, s)
+          print('hooks in:', p)
+
+          # 2b) the allocator marble's private aperture comes from
+          s = read(p)
+          if 'redwood_gpu_marble_allocator' not in s:
+              inc = '#include "redwood_gpu_service.inc"\n'
+              if inc not in s:
+                  sys.exit('anchor missing: redwood_gpu_service.inc')
+              alloc = inc + (
+                  '\n/* marble keeps the 3D core to a private aperture: reset once, before any client. */\n'
+                  'void\n'
+                  'redwood_gpu_marble_allocator(void)\n'
+                  '{\n'
+                  '\tif (gpu_free_count || gpu_va_live)\n'
+                  '\t\tpanic("marble GPU allocator already used");\n'
+                  '\tgpu_free[0].start = 0x4000000;\n'
+                  '\tgpu_free[0].size = 0x1c000000;\n'
+                  '\tgpu_free_count = 1;\n'
+                  '}\n')
+              s = s.replace(inc, alloc, 1)
+              write(p, s)
+          print('allocator in:', p)
+
+          # 3) RedwoodGPU.cpp: the C bridge the marble driver submits through
+          g = 'iokit/Kernel/RedwoodGPU.cpp'
+          s = read(g)
+          if 'MarbleGPURing.inc' not in s:
+              anchor = '#include "MiniIOSurface.h"\n'
+              if anchor not in s:
+                  sys.exit('anchor missing: MiniIOSurface.h in RedwoodGPU.cpp')
+              s = s.replace(anchor, anchor + '#include "MarbleGPURing.inc"\n', 1)
+              write(g, s)
+          print('RedwoodGPU.cpp: ring bridge included')
+          PY
+          echo "--- marble port in place ---"
+          grep -c 'marble' bsd/conf/files
+          grep -n 'marble_adreno_init' bsd/dev/redwood_adreno.c bsd/dev/*/redwood_adreno.c 2>/dev/null || true
+          grep -n 'MarbleGPURing' iokit/Kernel/RedwoodGPU.cpp
 
       - name: Build the kernel
         run: |
