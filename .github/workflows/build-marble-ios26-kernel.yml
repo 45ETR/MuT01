@@ -450,6 +450,36 @@ jobs:
           s = read(p)
           if 'buffers contiguous' not in s:
               sys.exit('contiguity patch did not land')
+
+          # 8) The runtime path repeats the same 16 KB assumption. Both
+          #    gpu_inactive_memory() and runtime_tables_prepare() test
+          #    (pa & 0x3fff) before logging anything, so a 4 KB-aligned
+          #    __bss buffer makes the cold test fail silently right after
+          #    the sequence audit. Relax those to 4 KB and trace the entry.
+          p = 'bsd/dev/marble_adreno.c'
+          s = read(p)
+          for old, new in [
+              ('(pa&0x3fff) || (tp&0x3fff)', '(pa&0xfff) || (tp&0xfff)'),
+              ('if(!pa || (pa&0x3fff) || pa+sizeof(runtime_tables)',
+               'if(!pa || (pa&0xfff) || pa+sizeof(runtime_tables)'),
+              ('if(!zap_metadata_pa || (zap_metadata_pa&0x3fff))return 0;',
+               'if(!zap_metadata_pa || (zap_metadata_pa&0xfff))return 0;'),
+              ('if(!pa || (pa&0x3fff) || pa+sizeof(runtime_target)',
+               'if(!pa || (pa&0xfff) || pa+sizeof(runtime_target)'),
+          ]:
+              if old not in s:
+                  sys.exit('anchor missing: alignment ' + old[:24])
+              s = s.replace(old, new, 1)
+          if 'marble-gpu-context: probe' not in s:
+              anchor = ('    uint64_t pa=kvtophys((vm_offset_t)gpu_ram),'
+                        'tp=kvtophys((vm_offset_t)gpu_tables);\n')
+              if anchor not in s:
+                  sys.exit('anchor missing: gpu_inactive_memory head')
+              s = s.replace(anchor, anchor +
+                  '    marble_gpu_log("marble-gpu-context: probe pa=%#llx tp=%#llx\\n",'
+                  '(unsigned long long)pa,(unsigned long long)tp);\n', 1)
+          write(p, s)
+          print('marble GPU buffers: runtime path relaxed to 4 KB alignment')
           PY
           echo "--- marble port in place ---"
           grep -c 'marble' bsd/conf/files
