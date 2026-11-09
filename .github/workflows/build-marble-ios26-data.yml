@@ -36,8 +36,9 @@ jobs:
           [ -n "$SIZE_MB" ] || SIZE_MB=1024
           IMG="$RUNNER_TEMP/vol.dmg"
           rm -f "$IMG"
-          # one shot: a read/write image formatted as APFS with a single volume named Data
-          hdiutil create -size "${SIZE_MB}m" -fs APFS -volname Data -type UDIF -ov "$IMG"
+          # one shot: a read/write image formatted as APFS with a single volume named Data.
+          # -layout NONE keeps the container at offset zero, exactly like the root image.
+          hdiutil create -size "${SIZE_MB}m" -fs APFS -volname Data -layout NONE -type UDIF -ov "$IMG"
           hdiutil imageinfo "$IMG" | sed -n '1,25p'
           echo "IMG=$IMG" >> "$GITHUB_ENV"
 
@@ -71,13 +72,28 @@ jobs:
           IMG="$IMG"
           DEV=$(hdiutil attach -nomount -nobrowse "$IMG" | awk 'NR==1 {print $1}')
           echo "attached as $DEV"
-          diskutil list "$DEV"
+          diskutil list "$DEV" || true
+          hdiutil pmap "$IMG" | head -20 || true
+          N=${DEV#/dev/}
           RAW="$RUNNER_TEMP/data.raw"
-          sudo dd if="$DEV" of="$RAW" bs=1m
+          found=""
+          # the container may sit on the whole device or on a partition slice: look for NXSB
+          for cand in "/dev/r$N" "/dev/r${N}s1" "/dev/r${N}s2" "/dev/r${N}s3"; do
+            [ -e "$cand" ] || continue
+            mag=$(sudo dd if="$cand" bs=1 skip=32 count=4 2>/dev/null | xxd -p | head -1 || true)
+            echo "candidate $cand magic=$mag"
+            if [ "$mag" = "4e585342" ] && [ -z "$found" ]; then found="$cand"; fi
+          done
+          if [ -z "$found" ]; then
+            echo "no APFS container on $DEV"
+            sudo hexdump -C -n 128 "/dev/r$N" || true
+            exit 1
+          fi
+          echo "copying $found"
+          sudo dd if="$found" of="$RAW" bs=1m
           hdiutil detach "$DEV" -force || true
           ls -l "$RAW"
-          # the first block must be an APFS container
-          xxd -l 32 "$RAW"
+          xxd -l 48 "$RAW"
           python3 -c "import struct;d=open('$RAW','rb').read(64);m,b,c=struct.unpack_from('<IIQ',d,32);print('nx_magic %#x block_size %d blocks %d total %.2f GiB' % (m,b,c,b*c/2**30));assert m==0x4253584e,'not an APFS container'"
 
       - name: Pack and publish the container
