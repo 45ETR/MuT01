@@ -328,6 +328,77 @@ jobs:
               s = s.replace(anchor, anchor + '#include "MarbleGPURing.inc"\n', 1)
               write(g, s)
           print('RedwoodGPU.cpp: ring bridge included')
+
+          # 4) marble_adreno.c: the iOS 26 loader publishes no /arm-io/marble-gpu
+          #    node, so describe this board from the profile the 16.5 loader built.
+          p = 'bsd/dev/marble_adreno.c'
+          s = read(p)
+          if 'marble_dtget' not in s:
+              anchor = ('bool marble_adreno_init(void);\n'
+                        'bool marble_adreno_init(void)\n{\n')
+              if anchor not in s:
+                  sys.exit('anchor missing: marble_adreno_init declaration')
+              look = ('if(SecureDTLookupEntry(NULL,"/arm-io/marble-gpu",&entry)!=kSuccess)return false;\n'
+                      '    __atomic_store_n(&marble_present,1,__ATOMIC_RELEASE);')
+              repl = ('bool dt_ok = SecureDTLookupEntry(NULL,"/arm-io/marble-gpu",&entry)==kSuccess;\n'
+                      '    if(!dt_ok) marble_gpu_log("marble-gpu: no device tree node; the board profile is built in\\n");\n'
+                      '    __atomic_store_n(&marble_present,1,__ATOMIC_RELEASE);')
+              if look not in s:
+                  sys.exit('anchor missing: SecureDTLookupEntry')
+              s = s.replace(look, repl, 1)
+              reads = s.count('SecureDTGetProperty(entry,')
+              s = s.replace('SecureDTGetProperty(entry,', 'marble_dtget(dt_ok, entry,')
+              helper = ('/* iOS 26 publishes no marble-gpu node: use the 16.5 board profile. */\n'
+                        'static const uint32_t marble_dt_chip_id = MARBLE_GPU_CHIP_ID;\n'
+                        'static kern_return_t\n'
+                        'marble_dtget(bool present, DTEntry entry, const char *name,\n'
+                        '    const void **value, unsigned int *size)\n'
+                        '{\n'
+                        '\tif (present) return SecureDTGetProperty(entry, name, value, size);\n'
+                        '\tif (!strcmp(name, "chip-id")) {\n'
+                        '\t\t*value = &marble_dt_chip_id; *size = sizeof(marble_dt_chip_id);\n'
+                        '\t\treturn kSuccess;\n'
+                        '\t}\n'
+                        '\tif (!strcmp(name, "windows")) {\n'
+                        '\t\t*value = marble_gpu_windows; *size = sizeof(marble_gpu_windows);\n'
+                        '\t\treturn kSuccess;\n'
+                        '\t}\n'
+                        '\tif (!strcmp(name, "tbu-windows")) {\n'
+                        '\t\t*value = marble_tbu_windows; *size = sizeof(marble_tbu_windows);\n'
+                        '\t\treturn kSuccess;\n'
+                        '\t}\n'
+                        '\tif (!strcmp(name, "cmd-db-window")) {\n'
+                        '\t\tstatic const uint64_t w[2] = { MARBLE_CMD_DB_PHYS, MARBLE_CMD_DB_BYTES };\n'
+                        '\t\t*value = w; *size = sizeof(w); return kSuccess;\n'
+                        '\t}\n'
+                        '\tif (!strcmp(name, "rpmh-window")) {\n'
+                        '\t\tstatic const uint64_t w[2] = { MARBLE_RPMH_PHYS, 0x100 };\n'
+                        '\t\t*value = w; *size = sizeof(w); return kSuccess;\n'
+                        '\t}\n'
+                        '\tif (!strcmp(name, "gmu-boot-window")) {\n'
+                        '\t\tstatic const uint64_t w[2] = { 0x03d9e000, 0x1000 };\n'
+                        '\t\t*value = w; *size = sizeof(w); return kSuccess;\n'
+                        '\t}\n'
+                        '\treturn (kern_return_t)1;\n'
+                        '}\n')
+              s = s.replace(anchor, helper + anchor, 1)
+              write(p, s)
+              print('marble DT fallback: rewired', reads, 'property reads')
+
+          # 5) the two ZAP digests the local firmware image carries
+          s = read(p)
+          pins = [
+              ('b957876634e6a9eab17ae39912ea3b4cb5ba811d0720b04ba0590e118c3cd46a',
+               'a6e69f2527531de243b0ad5194bf51c4fe616c263db21736278883aad081856b'),
+              ('41a11d0a7c9a6dd523bc1da3fdbeb887f04a9295072391fcdd4b8b71f713fedc',
+               '83857c373152a3b11021799ed27ee3f54caa7b0d7d436d331ef11e593c97bf4c'),
+          ]
+          for old_pin, new_pin in pins:
+              if old_pin not in s:
+                  sys.exit('anchor missing: firmware pin ' + old_pin[:12])
+              s = s.replace(old_pin, new_pin)
+          write(p, s)
+          print('marble firmware pins: a730_zap.mdt / a730_zap.b02 re-pinned')
           PY
           echo "--- marble port in place ---"
           grep -c 'marble' bsd/conf/files
