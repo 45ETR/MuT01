@@ -227,6 +227,112 @@ jobs:
           python3 /tmp/bringup.py
           grep -c 'loader_checkpoint([0-9]' osfmk/kern/startup.c
 
+      - name: Port the marble GPU stack (Adreno 725) onto the tree
+        run: |
+          set -e -o pipefail
+          MARBLE_REF="${{ inputs.marble_ref }}"
+          echo "hackios-marble ref: $MARBLE_REF"
+          rm -rf /tmp/hm /tmp/hm.tar.gz
+          curl -fsSL --retry 3 -o /tmp/hm.tar.gz "https://codeload.github.com/yukoimi/hackios-marble/tar.gz/$MARBLE_REF"
+          mkdir -p /tmp/hm
+          tar -xzf /tmp/hm.tar.gz -C /tmp/hm --strip-components=1
+          SRC=/tmp/hm/xnu/files
+          ls -l "$SRC/bsd/dev/marble_adreno.c" "$SRC/bsd/dev/marble_smmu.c" "$SRC/iokit/Kernel/MarbleGPURing.inc"
+          cd tree/xnu-src/xnu-12377.121.6
+          cp -v "$SRC/bsd/dev/marble_adreno.c" bsd/dev/
+          cp -v "$SRC/bsd/dev/marble_smmu.c" bsd/dev/
+          rm -rf bsd/dev/marble_gpu
+          mkdir -p bsd/dev/marble_gpu
+          cp -R "$SRC/bsd/dev/marble_gpu/." bsd/dev/marble_gpu/
+          cp -v "$SRC/iokit/Kernel/MarbleGPURing.inc" iokit/Kernel/
+          echo "headers: $(find bsd/dev/marble_gpu -name '*.h' | wc -l)  sources: $(find bsd/dev/marble_gpu -name '*.c' | wc -l)"
+          python3 - <<'PY'
+          import glob, sys
+
+          def read(p): return open(p, encoding='utf-8').read()
+          def write(p, s): open(p, 'w', encoding='utf-8').write(s)
+
+          # 1) bsd/conf/files: the marble sources, the same list the iOS 16.5 tree builds
+          conf = 'bsd/conf/files'
+          s = read(conf)
+          entries = [
+              'bsd/dev/marble_adreno.c',
+              'bsd/dev/marble_smmu.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoPM4.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoFirmware.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoHfi.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoHfiStartup.c',
+              'bsd/dev/marble_gpu/upstream/AdrenoHfiVotes.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4K.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KContext.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KProgram.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KStreams.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KAudit.c',
+              'bsd/dev/marble_gpu/upstream/ArmSmmu4KLive.c',
+          ]
+          if 'marble_adreno.c' not in s:
+              s = s.rstrip('\n') + '\n' + ''.join(e + '\tstandard\n' for e in entries)
+              write(conf, s)
+          print('conf/files: marble lines =', sum(1 for l in read(conf).splitlines() if 'marble' in l))
+
+          # 2) redwood_adreno.c: let the marble driver take the GPU on this board
+          cands = glob.glob('bsd/dev/**/redwood_adreno.c', recursive=True)
+          if not cands:
+              sys.exit('no redwood_adreno.c in the tree')
+          p = cands[0]
+          s = read(p)
+          if 'marble_adreno_init' not in s:
+              a_init = 'void\nredwood_adreno_init(void)\n{\n'
+              hook_init = a_init + ('\textern bool marble_adreno_init(void);\n'
+                                    '\tif (marble_adreno_init()) return;\n')
+              if a_init not in s:
+                  sys.exit('anchor missing: redwood_adreno_init')
+              s = s.replace(a_init, hook_init, 1)
+              a_q = 'void\nredwood_adreno_quiesce(void)\n{\n'
+              hook_q = a_q + ('\textern bool marble_adreno_quiesce(void);\n'
+                              '\tif (marble_adreno_quiesce()) return;\n')
+              if a_q in s:
+                  s = s.replace(a_q, hook_q, 1)
+              write(p, s)
+          print('hooks in:', p)
+
+          # 2b) the allocator marble's private aperture comes from
+          s = read(p)
+          if 'redwood_gpu_marble_allocator' not in s:
+              inc = '#include "redwood_gpu_service.inc"\n'
+              if inc not in s:
+                  sys.exit('anchor missing: redwood_gpu_service.inc')
+              alloc = inc + (
+                  '\n/* marble keeps the 3D core to a private aperture: reset once, before any client. */\n'
+                  'void\n'
+                  'redwood_gpu_marble_allocator(void)\n'
+                  '{\n'
+                  '\tif (gpu_free_count || gpu_va_live)\n'
+                  '\t\tpanic("marble GPU allocator already used");\n'
+                  '\tgpu_free[0].start = 0x4000000;\n'
+                  '\tgpu_free[0].size = 0x1c000000;\n'
+                  '\tgpu_free_count = 1;\n'
+                  '}\n')
+              s = s.replace(inc, alloc, 1)
+              write(p, s)
+          print('allocator in:', p)
+
+          # 3) RedwoodGPU.cpp: the C bridge the marble driver submits through
+          g = 'iokit/Kernel/RedwoodGPU.cpp'
+          s = read(g)
+          if 'MarbleGPURing.inc' not in s:
+              anchor = '#include "MiniIOSurface.h"\n'
+              if anchor not in s:
+                  sys.exit('anchor missing: MiniIOSurface.h in RedwoodGPU.cpp')
+              s = s.replace(anchor, anchor + '#include "MarbleGPURing.inc"\n', 1)
+              write(g, s)
+          print('RedwoodGPU.cpp: ring bridge included')
+          PY
+          echo "--- marble port in place ---"
+          grep -c 'marble' bsd/conf/files
+          grep -n 'marble_adreno_init' bsd/dev/redwood_adreno.c bsd/dev/*/redwood_adreno.c 2>/dev/null || true
+          grep -n 'MarbleGPURing' iokit/Kernel/RedwoodGPU.cpp
+
       - name: Build the kernel
         run: |
           set -eo pipefail
