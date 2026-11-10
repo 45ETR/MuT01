@@ -237,7 +237,7 @@ rung_oslog(void)
 {
 	os_log_t log = os_log_create("com.redwood.probe", "rung");
 
-	step("  os_log_create -> %p", (void *) log);
+	step("  os_log_create -> %p", (__bridge void *) log);
 }
 
 static void
