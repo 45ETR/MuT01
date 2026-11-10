@@ -82,7 +82,7 @@ jobs:
         run: |
           set -euo pipefail
           SRC="${{ inputs.source_dir }}"
-          need="redwoodmetal.m redwooddrawable.m redwood_drawable.h metal_props.c metal_plugin.plist"
+          need="redwoodmetal.m redwooddrawable.m redwood_drawable.h metal_props.c metal_plugin.plist metal_probe.m"
           miss=""
           for f in $need; do
             [ -f "$SRC/$f" ] || miss="$miss $f"
@@ -153,6 +153,11 @@ jobs:
               $cc $WARN -framework CoreFoundation -framework IOKit \
                 -o out/bin/metal_props "$SRC/metal_props.c" || exit 1
 
+              # 探针是必编项：metal_test / metal_drv_test 编不过只 warn，害得上一轮包里只有 metal_props，
+              # 谁也不知道 Metal 到底走没走。这个编不过就是失败。
+              $cc $WARN -fobjc-arc -framework Foundation -framework IOKit -framework Metal \
+                -o out/bin/metal_probe "$SRC/metal_probe.m" || exit 1
+
               cp "$SRC/metal_plugin.plist" out/lib/RedwoodMetal.bundle/Info.plist || exit 1
 
               if [ -f "$SRC/metal_drv_test.m" ]; then
@@ -217,7 +222,7 @@ jobs:
           } >> "$SUM"
 
           echo "--- 1. 架构 ---"
-          for f in "$DYLIB" "$BUNDLE" out/bin/metal_props; do
+          for f in "$DYLIB" "$BUNDLE" out/bin/metal_props out/bin/metal_probe; do
             printf '  %-10s %s\n' "$(lipo -archs "$f")" "$f"
           done
 
