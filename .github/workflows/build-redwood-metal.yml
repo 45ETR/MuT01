@@ -80,8 +80,40 @@ jobs:
       - name: 检查源码是否齐
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           SRC="${{ inputs.source_dir }}"
+
+          # source_dir 是手填的，仓库布局却各次不同（有人放在 userland/src，有人整套塞在
+          # redwood-metal-arm64e/ 下面）。指错了不该让人去猜，就地找一遍。
+          if [ ! -f "$SRC/redwoodmetal.m" ]; then
+            echo "::warning::$SRC/redwoodmetal.m 不存在，自动找 redwoodmetal.m"
+            finds=$(find . -name redwoodmetal.m -not -path './.git/*' 2>/dev/null | head -20)
+            if [ -z "$finds" ]; then
+              echo "::error::整棵仓库里都找不到 redwoodmetal.m"
+              echo "仓库根目录（$(pwd)）长这样："
+              ls -la
+              echo "把 userland/src 整个搬进来，或把 source_dir 指到含 redwoodmetal.m 的那层。"
+              exit 1
+            fi
+            echo "找到这些："
+            echo "$finds"
+            # 仓库里可能同时存在两份（根目录 userland/src 和某个打包目录下的副本）。
+            # 先要 metal_probe.m + metal_props.c 都齐的，其次只要 metal_props.c，最后才取第一个。
+            SRC=""
+            for f in $finds; do
+              d=$(dirname "$f")
+              if [ -f "$d/metal_probe.m" ] && [ -f "$d/metal_props.c" ]; then SRC="$d"; break; fi
+            done
+            if [ -z "$SRC" ]; then
+              for f in $finds; do
+                d=$(dirname "$f")
+                if [ -f "$d/metal_props.c" ]; then SRC="$d"; break; fi
+              done
+            fi
+            if [ -z "$SRC" ]; then SRC=$(dirname "$(echo "$finds" | head -1)"); fi
+            echo "::notice::改用 $SRC"
+          fi
+
           need="redwoodmetal.m redwooddrawable.m redwood_drawable.h metal_props.c metal_plugin.plist metal_probe.m"
           miss=""
           for f in $need; do
@@ -89,12 +121,17 @@ jobs:
           done
           if [ -n "$miss" ]; then
             echo "::error::$SRC 里缺:$miss"
-            echo "把这些文件从 hackios-xnu-kernel 的 userland/src/ 搬进仓库再跑。"
-            echo "当前 $SRC 有什么："
+            echo "$SRC 里现有："
             ls -la "$SRC" 2>/dev/null || echo "  (目录不存在)"
+            case "$miss" in
+              *metal_probe.m*)
+                echo "::error::metal_probe.m 是这轮新加的探针，放到 $SRC/ 下面（与 redwoodmetal.m 同级）。" ;;
+            esac
+            echo "把这些文件从 hackios-xnu-kernel 的 userland/src/ 搬进仓库再跑。"
             exit 1
           fi
           echo "源码目录 $SRC 齐了。"
+          echo "SRC_DIR=$SRC" >> "$GITHUB_ENV"
           wc -l "$SRC/redwoodmetal.m" "$SRC/redwooddrawable.m"
           # 5609 行那份是 16.5 的，靠 include 分片；26 线是单文件 6333 行
           lines=$(wc -l < "$SRC/redwoodmetal.m")
@@ -108,7 +145,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          SRC="${{ inputs.source_dir }}"
+          SRC="${SRC_DIR:-${{ inputs.source_dir }}}"
           ARCH="${{ inputs.arch }}"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           SDKVER="$(xcrun --sdk iphoneos --show-sdk-version)"
