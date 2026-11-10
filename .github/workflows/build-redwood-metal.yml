@@ -129,30 +129,31 @@ jobs:
 
           mkdir -p out/lib/RedwoodMetal.bundle out/bin
 
-          # 用子 shell 包住：函数出现在 if 的条件里时 set -e 会失效，
-          # 那样第一条编译失败还会继续往下走。子 shell 让失败如实冒出来。
+          # 坑：函数一旦出现在 `||` 列表里（下面要抓退出码），bash 会把 errexit 整个屏蔽掉，
+          # 连函数内的子 shell 都继承这个屏蔽 —— 此时 set -e 形同虚设，编译失败会静默往下走。
+          # 所以这里不依赖 set -e，每条关键命令都显式 `|| exit 1`。
           build_group() {
             local arch="$1"
             (
-              set -euo pipefail
+              set -uo pipefail
               cc="xcrun --sdk iphoneos clang -arch $arch -miphoneos-version-min=$MIN -isysroot $SDK -O1 -I$SRC"
 
-              echo "== 用 $arch 编（min iOS $MIN / SDK $SDKVER）"
-              rm -rf out/lib out/bin
-              mkdir -p out/lib/RedwoodMetal.bundle out/bin
+              echo "== 用 ${arch} 编（min iOS ${MIN} / SDK ${SDKVER}）"
+              rm -rf out/lib out/bin || exit 1
+              mkdir -p out/lib/RedwoodMetal.bundle out/bin || exit 1
 
               $cc $WARN -dynamiclib -install_name /redwood/lib/libredwoodmetal.dylib \
                 $COMMON -o out/lib/libredwoodmetal.dylib \
-                "$SRC/redwoodmetal.m" "$SRC/redwooddrawable.m"
+                "$SRC/redwoodmetal.m" "$SRC/redwooddrawable.m" || exit 1
 
               $cc $WARN -bundle $COMMON \
                 -o out/lib/RedwoodMetal.bundle/RedwoodMetal \
-                "$SRC/redwoodmetal.m" "$SRC/redwooddrawable.m"
+                "$SRC/redwoodmetal.m" "$SRC/redwooddrawable.m" || exit 1
 
               $cc $WARN -framework CoreFoundation -framework IOKit \
-                -o out/bin/metal_props "$SRC/metal_props.c"
+                -o out/bin/metal_props "$SRC/metal_props.c" || exit 1
 
-              cp "$SRC/metal_plugin.plist" out/lib/RedwoodMetal.bundle/Info.plist
+              cp "$SRC/metal_plugin.plist" out/lib/RedwoodMetal.bundle/Info.plist || exit 1
 
               if [ -f "$SRC/metal_drv_test.m" ]; then
                 $cc $WARN $COMMON -o out/bin/metal_drv_test "$SRC/metal_drv_test.m" \
@@ -175,14 +176,17 @@ jobs:
           }
 
           ARCH_USED=""
-          if build_group "$ARCH"; then
+          rc=0
+          build_group "$ARCH" || rc=$?
+          if [ "$rc" = 0 ]; then
             ARCH_USED="$ARCH"
           elif [ "${{ inputs.allow_arch_fallback }}" = "true" ] && [ "$ARCH" != "arm64" ]; then
-            echo "::warning::$ARCH 编不过，退回 arm64（arm64e 进程能加载 arm64 dylib，但 PAC 路径不同，真机风险更高）"
-            build_group arm64
+            echo "::warning::${ARCH} 编译失败（退出码 ${rc}），退回 arm64。arm64e 进程能加载 arm64 dylib，但 PAC 路径不同，真机风险更高。"
+            echo "::warning::先看上面第一处报错：若报的是 unbound variable / syntax error，那是 workflow 脚本自身的问题，不是源码编不过。"
+            build_group arm64 || exit 1
             ARCH_USED="arm64"
           else
-            echo "::error::编译失败"
+            echo "::error::编译失败，退出码 ${rc}"
             exit 1
           fi
 
@@ -226,13 +230,13 @@ jobs:
 
           echo "--- 4. 导出的驱动类（Metal 用它按 MetalPluginClassName 找） ---"
           nm -gU "$BUNDLE" | grep -F '_OBJC_CLASS_$_RedwoodMetalDevice' || {
-            echo "::error::bundle 里没有 _OBJC_CLASS_$_RedwoodMetalDevice，Metal 的 classNamed: 会拿到 nil"
+            echo "::error::bundle 里没有 _OBJC_CLASS_\$_RedwoodMetalDevice，Metal 的 classNamed: 会拿到 nil"
             fail=1
           }
 
           echo "--- 5. 私有基类 _MTLDevice 是未定义符号（从 Metal.framework 绑定） ---"
           nm -u "$BUNDLE" | grep -F '_OBJC_CLASS_$__MTLDevice' || {
-            echo "::error::没有 _OBJC_CLASS_$__MTLDevice 引用，说明没真的继承 Apple 的私有基类"
+            echo "::error::没有 _OBJC_CLASS_\$__MTLDevice 引用，说明没真的继承 Apple 的私有基类"
             fail=1
           }
 
@@ -325,17 +329,27 @@ jobs:
             echo "## 拿到之后怎么装"
             echo
             echo '```'
-            echo "# 1. 铺到 /redwood（tar 包解到根就是 /redwood/lib 和 /redwood/bin）"
+            echo "# 1. 铺到 /redwood（包里的 lib/ 和 bin/ 直接展开，得到 /redwood/lib 和 /redwood/bin）"
             echo "tar -xzf redwood-metal-*.tar.gz -C /redwood"
             echo
-            echo "# 2. 让 Metal 的固定路径指到它"
+            echo "# 2. 内核必须带 metal=1 启动，否则下面那步会返回 kIOReturnUnsupported"
+            echo
+            echo "# 3. 让 Metal 的固定路径指到它。根盘可写时用软链："
             echo "ln -sf /redwood/lib/RedwoodMetal.bundle /System/Library/Extensions/RedwoodMetal.bundle"
             echo
-            echo "# 3. 内核必须带 metal=1 启动，然后打开两个属性"
-            echo "/redwood/bin/metal_props on"
-            echo "/redwood/bin/metal_props show     # 期望 RedwoodMetal / RedwoodMetalDevice"
+            echo "#    根盘只读（本移植的常态）就绕路径：Metal 只是把 NAME 拼进 /System/Library/Extensions/NAME.bundle，"
+            echo "#    NAME 里带 ../.. 一样成立，不需要写 /System/Library："
+            echo "/redwood/bin/metal_props on ../../redwood/lib/RedwoodMetal RedwoodMetalDevice"
             echo '```'
             echo
-            echo "判定成功：IOMFB 内核日志出现 swap，且 Metal 侧 MTLCreateSystemDefaultDevice() 返回非 nil。"
-            echo "仍无 swap 时先看 metal_props show 有没有值，再看 /System/Library/Extensions/RedwoodMetal.bundle 是否解到。"
+            echo "### 验收看这三行（metal_props show 自己会判）"
+            echo
+            echo '```'
+            echo "metal_props: MetalPluginName = RedwoodMetal"
+            echo "metal_props: MetalPluginClassName = RedwoodMetalDevice"
+            echo "metal_props: Metal would open /System/Library/Extensions/RedwoodMetal.bundle: it is there"
+            echo '```'
+            echo
+            echo "第三行是 NOT THERE 就还没通，别急着重启：说明 bundle 没铺到 Metal 能解析到的位置。"
+            echo "三行都对了，再看内核日志有没有 \`MiniIOMobileFramebuffer: swap\`，以及 MTLCreateSystemDefaultDevice() 是否非 nil。"
           } >> "$GITHUB_STEP_SUMMARY"
