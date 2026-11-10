@@ -23,7 +23,15 @@
  *   child E  the same, after setenv("OS_ACTIVITY_MODE", "disable")       -- the knob
  *   child F  MTLCreateSystemDefaultDevice()                              -- as it is
  *   child G  the same, after the same setenv                             -- the knob
+ *   child H  [fix] os_log_create                                          -- the cure
+ *   child I  [fix] [[_MTLDevice alloc] init]                              -- the cure
+ *   child J  [fix] MTLCreateSystemDefaultDevice                           -- the cure
+ *   child K  [fix]  -initWithAcceleratorPort:                             -- the cure
  *   parent   STEP 8  backboardd / SpringBoard pids; with "kick" a SIGTERM to backboardd
+ *
+ * H..K repeat A..F after `install_activity_fix()`: voucher_activity_flush() is rewritten to a
+ * plain `ret`, which is the whole of what k36 said was missing. H returning where A hung is
+ * the proof; K returning a device means the driver was never the problem.
  *
  * Every child keeps v2's handlers, so a child that faults prints the signal and a stack with the
  * image each frame belongs to, instead of disappearing.
@@ -40,10 +48,12 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <execinfo.h>
+#include <mach/mach.h>
 #include <objc/runtime.h>
 #include <os/log.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -169,6 +179,89 @@ step(const char *fmt, ...)
 	va_end(ap);
 	printf("\n");
 	fflush(stdout);
+}
+
+/*
+ * The activity fix.
+ *
+ * k36 rung A settled it: os_log_create() by itself never returns. It dispatch_sync()s into
+ * libsystem_trace, which calls voucher_activity_flush(), which mach_msg()s a request and
+ * waits for a reply this userspace never sends -- launchd says as much at boot, "System
+ * logger socket was not opened during early boot. (Proceeding anyway)". Every Metal init
+ * creates a log ([_MTLDevice init] does), so nothing that logs can start, which is why
+ * backboardd and SpringBoard came up and then did nothing at all.
+ *
+ * voucher_activity_flush is `void` and is called across an image boundary, so one `ret` at
+ * its entry replaces it completely and the caller simply carries on. Losing activity
+ * tracing is exactly the trade we want here.
+ *
+ * If that symbol turns out not to be exported, the fallback rewrites os_log_create's own
+ * entry to `return os_log_default` -- the only object it could usefully return anyway.
+ * Three instructions, built at runtime so no literal pool or second mapping is needed:
+ *
+ *     adrp x0, <page of os_log_default>
+ *     ldr  x0, [x0, <offset of os_log_default>]
+ *     ret
+ */
+static int
+make_writable(void *p, size_t n)
+{
+	long ps = sysconf(_SC_PAGESIZE);
+	vm_address_t a = (vm_address_t) p & ~((vm_address_t) ps - 1);
+	vm_address_t e = ((vm_address_t) p + n + (vm_address_t) ps - 1) & ~((vm_address_t) ps - 1);
+
+	return vm_protect(mach_task_self(), a, (vm_size_t) (e - a), 0,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS ? 0 : 1;
+}
+
+/* 0 = patched, 1 = could not, and the caller should say so and carry on */
+static int
+install_activity_fix(void)
+{
+	void *flush = dlsym(RTLD_DEFAULT, "voucher_activity_flush");
+
+	if (flush != NULL) {
+		uint32_t ret = 0xd65f03c0u;
+
+		if (make_writable(flush, sizeof(ret)) != 0) {
+			step("  fix: page of voucher_activity_flush is not writable");
+			return 1;
+		}
+		memcpy(flush, &ret, sizeof(ret));
+		__builtin___clear_cache((char *) flush, (char *) flush + sizeof(ret));
+		step("  fix: voucher_activity_flush @ %p -> ret", flush);
+		return 0;
+	}
+
+	{
+		void *create = dlsym(RTLD_DEFAULT, "os_log_create");
+		void *dflt = dlsym(RTLD_DEFAULT, "os_log_default");
+		uint32_t code[3];
+		uint64_t target, pc;
+		int64_t delta;
+		uint32_t imm, imm12;
+
+		if (create == NULL || dflt == NULL) {
+			step("  fix: neither voucher_activity_flush nor os_log_create is reachable");
+			return 1;
+		}
+		target = (uint64_t) (uintptr_t) dflt;
+		pc = (uint64_t) (uintptr_t) create;
+		delta = (int64_t) ((target & ~(uint64_t) 0xfff) - (pc & ~(uint64_t) 0xfff));
+		imm = (uint32_t) (delta >> 12);
+		code[0] = 0x90000000u | ((imm & 3u) << 29) | (((imm >> 2) & 0x7ffffu) << 5);
+		imm12 = (uint32_t) ((target & 0xfffu) >> 3);
+		code[1] = 0xf9400000u | (imm12 << 10);
+		code[2] = 0xd65f03c0u;
+		if (make_writable(create, sizeof(code)) != 0) {
+			step("  fix: page of os_log_create is not writable");
+			return 1;
+		}
+		memcpy(create, code, sizeof(code));
+		__builtin___clear_cache((char *) create, (char *) create + sizeof(code));
+		step("  fix: os_log_create @ %p -> return os_log_default (%p)", create, dflt);
+		return 0;
+	}
 }
 
 /*
@@ -315,6 +408,36 @@ rung_mtl_device_noactivity(void)
 	rung_mtl_device();
 }
 
+/* ---- H..K: the same four, after the activity fix ---- */
+
+static void
+rung_fix_oslog(void)
+{
+	install_activity_fix();
+	rung_oslog();
+}
+
+static void
+rung_fix_mtldevice_init(void)
+{
+	install_activity_fix();
+	rung_mtldevice_init();
+}
+
+static void
+rung_fix_mtl_device(void)
+{
+	install_activity_fix();
+	rung_mtl_device();
+}
+
+static void
+rung_fix_direct_init(void)
+{
+	install_activity_fix();
+	rung_direct_init();
+}
+
 /* ---- the property channel, unchanged from v1 ---- */
 
 static CFTypeRef
@@ -421,7 +544,11 @@ main(int argc, char **argv)
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	install_handlers();
-	step("start, mode=%s, uid=%d", mode, getuid());
+	/* does launchd actually pass EnvironmentVariables through? k35 set OS_ACTIVITY_MODE in
+	 * the plist and the stack did not change, but nothing ever printed the environment, so
+	 * "the knob does nothing" and "the knob never arrived" were still indistinguishable. */
+	step("start, mode=%s, uid=%d, REDWOOD_PROBE_ENV=%s", mode, getuid(),
+	    getenv("REDWOOD_PROBE_ENV") ?: "(unset)");
 
 	step("STEP 1: looking for IOAcceleratorES");
 	gService = IOServiceGetMatchingService(0, IOServiceMatching("IOAcceleratorES"));
@@ -498,6 +625,15 @@ main(int argc, char **argv)
 	rung("F: MTLCreateSystemDefaultDevice as it is", rung_mtl_device, 25);
 	rung("G: MTLCreateSystemDefaultDevice with OS_ACTIVITY_MODE=disable",
 	    rung_mtl_device_noactivity, 25);
+
+	/* The four that matter: same calls, with voucher_activity_flush turned into a `ret`.
+	 * H passing where A hung is the proof; K passing means the driver itself was never the
+	 * problem and the device object exists. */
+	step("STEP 7b: the same, with the activity fix");
+	rung("H: [fix] os_log_create", rung_fix_oslog, 15);
+	rung("I: [fix] [[_MTLDevice alloc] init]", rung_fix_mtldevice_init, 25);
+	rung("J: [fix] MTLCreateSystemDefaultDevice", rung_fix_mtl_device, 25);
+	rung("K: [fix] -initWithAcceleratorPort:", rung_fix_direct_init, 30);
 
 	step("STEP 8: the display clients");
 	bb = pid_of("backboardd");

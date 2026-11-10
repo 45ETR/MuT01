@@ -95,9 +95,11 @@
 #import <objc/runtime.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <mach/mach.h>
 
 #include "redwood_drawable.h"
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1127,10 +1129,63 @@ struct gem_close { uint32_t handle, pad; };
 			length:(NSUInteger)length;
 @end
 
+/*
+ * The reason this driver could not even be constructed.
+ *
+ * A probe run on 2026-11-10 (metal_probe rungs A..G) found that os_log_create() by itself
+ * never returns in this userspace: it dispatch_sync()s into libsystem_trace, which calls
+ * voucher_activity_flush(), which mach_msg()s a request and waits for a reply nothing ever
+ * sends. libsystem Launchd says so at boot -- "System logger socket was not opened during
+ * early boot. (Proceeding anyway)". [_MTLDevice init] creates a log, so every
+ * -initWithAcceleratorPort: hung in its first statement, before one line of this file ran,
+ * and so did every other process that logs, which is why the panel stayed dark.
+ *
+ * voucher_activity_flush is `void` and is called across an image boundary, so one `ret` at
+ * its entry replaces it completely: the caller carries on, activity tracing is lost, and
+ * that is the whole trade. Done in +load because Metal loads this bundle before it
+ * instantiates the class, so the patch is in place before the init that needs it.
+ */
+static void
+rw_activity_fix(void)
+{
+	static int done;
+	void *flush;
+
+	if (done) {
+		return;
+	}
+	done = 1;
+
+	flush = dlsym(RTLD_DEFAULT, "voucher_activity_flush");
+	if (flush == NULL) {
+		rw_print("voucher_activity_flush is not reachable; logs will hang this process\n");
+		return;
+	}
+
+	{
+		uint32_t ret = 0xd65f03c0u;
+		long ps = sysconf(_SC_PAGESIZE);
+		vm_address_t page = (vm_address_t) flush & ~((vm_address_t) ps - 1);
+		kern_return_t kr = vm_protect(mach_task_self(), page, (vm_size_t) ps, 0,
+		    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+
+		if (kr != KERN_SUCCESS) {
+			rw_print("voucher_activity_flush @ %p is not writable (%#x); "
+			         "logs will hang this process\n", flush, kr);
+			return;
+		}
+		memcpy(flush, &ret, sizeof(ret));
+		__builtin___clear_cache((char *) flush, (char *) flush + sizeof(ret));
+		rw_print("voucher_activity_flush @ %p -> ret (the log stream has no server)\n",
+		         flush);
+	}
+}
+
 @implementation RedwoodMetalDevice
 
 + (void)load
 {
+	rw_activity_fix();
 	ensure_spi(self);
 }
 
