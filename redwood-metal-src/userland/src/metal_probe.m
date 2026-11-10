@@ -1,35 +1,32 @@
 /*
- * metal_probe: one process, one pass, the whole Metal ladder, printed to /dev/console.
+ * metal_probe: the whole Metal ladder, one rung at a time, printed to /dev/console.
  *
- * Every rung is printed *before* it is tried and flushed, because the next rung can abort the
- * process (Metal's conditions on a device object are asserts -- docs/metal.md 10.2-10.3). A log
- * that stops after "STEP n" is itself the answer: rung n is where it died.
+ * v3 exists because v2 found the hang and the frame it hangs in, but not whether the frame is
+ * the *cause* or a symptom, and not whether the one knob we know of (OS_ACTIVITY_MODE) helps:
  *
- * v2 adds three things the first boot asked for (that boot stopped dead at
- * MTLCreateSystemDefaultDevice with nothing printed inside, which is the one outcome the plain
- * ladder cannot tell apart from "the process was killed"):
+ *   #26 RedwoodMetal  -[RedwoodMetalDevice initWithAcceleratorPort:]
+ *   #18 CoreFoundation CFCopySearchPathForDirectoriesInDomains
+ *   #12 libsystem_trace os_log_create
+ *   #8  libdispatch    voucher_activity_flush
+ *   #4  libsystem_kernel mach_msg            <-- never returns
  *
- *   - a handler on SIGSEGV/SIGBUS/SIGABRT/SIGILL/SIGALRM that prints the signal *and a
- *     backtrace with the image each frame belongs to* (dladdr), straight to fd 2 with write(2),
- *     so it cannot block on a stdio lock the hanging frame might be holding;
- *   - an alarm around each rung, so a rung that never returns is distinguishable from a rung
- *     that returns a poor answer;
- *   - a heartbeat thread that prints the rung it last entered every five seconds, so "blocked
- *     here" and "taken out from outside without a word" are told apart (the first boot at this
- *     point could not tell them apart);
- *   - a rung that instantiates this driver's device class DIRECTLY, without Metal's
- *     registration in the way. That splits "our driver hangs in -initWithAcceleratorPort:"
- *     from "Metal hangs before it ever calls us", which are two different repairs.
+ * So each risky rung now runs in its OWN forked child, with its own timeout. A rung that hangs
+ * costs that child and nothing else: the parent kills it and moves to the next rung, and the
+ * whole picture comes out of one boot instead of one boot per question. The parent's heartbeat
+ * every five seconds is what tells "still working" from "the parent died too".
  *
- *   STEP 1  IOAcceleratorES is in the registry
- *   STEP 2  the two properties, as they are now
- *   STEP 3  set them (unless argv[1] is "keep"), and read them back
- *   STEP 4  /System/Library/Extensions/RedwoodMetal.bundle resolves
- *   STEP 5  the bundle's executable dlopen()s -- dlerror() printed if not
- *   STEP 6  NSClassFromString("RedwoodMetalDevice"), MTLDeviceSPI, and conformance
- *   STEP 7  the class instantiated directly, -initWithAcceleratorPort: -- no Metal between us
- *   STEP 8  MTLCreateSystemDefaultDevice() pointer, and name/registryID if it is not nil
- *   STEP 9  backboardd / SpringBoard pids; with "kick" a SIGTERM to backboardd
+ *   parent   STEP 1  IOAcceleratorES, the two properties, set them, bundle path, dlopen, class
+ *   child A  os_log_create("com.redwood.probe", "rung")
+ *   child B  NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES)
+ *   child C  [[_MTLDevice alloc] init]                                    -- Metal, no driver
+ *   child D  [[RedwoodMetalDevice alloc] initWithAcceleratorPort:]        -- as it is
+ *   child E  the same, after setenv("OS_ACTIVITY_MODE", "disable")       -- the knob
+ *   child F  MTLCreateSystemDefaultDevice()                              -- as it is
+ *   child G  the same, after the same setenv                             -- the knob
+ *   parent   STEP 8  backboardd / SpringBoard pids; with "kick" a SIGTERM to backboardd
+ *
+ * Every child keeps v2's handlers, so a child that faults prints the signal and a stack with the
+ * image each frame belongs to, instead of disappearing.
  *
  * Build (macOS, same flags as the rest of bin/):
  *   xcrun --sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 \
@@ -44,7 +41,7 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <objc/runtime.h>
-#include <pthread.h>
+#include <os/log.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -52,14 +49,14 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define kPluginNameKey  "MetalPluginName"
 #define kPluginClassKey "MetalPluginClassName"
 
 /* The three of this driver's own answers that are not in any public Metal header. Declared so
- * the calls below compile; the class answers them (see redwoodmetal.m), and asking for them
- * through a protocol here is the same trick the driver uses on MTLDeviceSPI. */
+ * the calls below compile; the class answers them (see redwoodmetal.m). */
 @protocol RWProbeDevice <NSObject>
 - (instancetype)initWithAcceleratorPort:(io_service_t)port;
 - (NSUInteger)featureProfile;
@@ -68,6 +65,9 @@
 
 extern kern_return_t set_cf_properties(io_registry_entry_t entry, CFTypeRef properties)
     __asm("_IORegistryEntrySetCFProperties");
+
+/* one io_service_t, kept here so a forked child inherits it without passing anything around */
+static io_service_t gService;
 
 /* write(2) only: a handler must not take a stdio lock, and the frame that hangs may hold one. */
 static void
@@ -119,8 +119,7 @@ on_signal(int sig)
 	const char *name = "?";
 
 	/* SA_NODEFER lets the same signal come back in while the dump is running; if the dump
-	 * itself faults that would be a loop with no output at all, which is the one answer
-	 * worse than a wrong one. */
+	 * itself faults that would be a loop with no output at all. */
 	if (in_handler) {
 		_exit(4);
 	}
@@ -135,10 +134,10 @@ on_signal(int sig)
 	case SIGTERM: name = "SIGTERM"; break;
 	default: break;
 	}
-	say("metal_probe: !!! %s (%d) at the rung now running", name, sig);
+	say("metal_probe: !!! %s (%d)", name, sig);
 	dump_stack();
 	if (sig == SIGALRM) {
-		return;   /* the rung is still running; let it be */
+		return;   /* the rung keeps waiting; the parent's timeout will collect the child */
 	}
 	_exit(3);
 }
@@ -159,59 +158,6 @@ install_handlers(void)
 	}
 }
 
-/* A rung that has not returned by `seconds` is a rung that hangs: the alarm's backtrace says
- * where, in which image. One-shot; disarmed by passing 0. */
-static void
-watch(unsigned seconds)
-{
-	alarm(seconds);
-}
-
-/*
- * A killed process and a blocked one look the same on this console: both stop printing. The
- * heartbeat is the difference -- if it keeps coming the process is alive and stuck on `rung`,
- * and if it stops without a signal dump the process was taken out from outside.
- */
-static volatile int gRung;
-static void *gRungName = (void *) "start";
-
-static void
-mark(int rung, const char *name)
-{
-	gRung = rung;
-	gRungName = (void *) name;
-}
-
-static void *
-heartbeat(void *arg)
-{
-	unsigned tick = 0;
-
-	(void) arg;
-	for (;;) {
-		sleep(5);
-		if (gRung < 0) {
-			return NULL;   /* the ladder finished: stop talking */
-		}
-		tick++;
-		say("metal_probe: heartbeat %u, still at rung %d (%s), uid=%d",
-		    tick, gRung, (const char *) gRungName, getuid());
-	}
-	return NULL;
-}
-
-static void
-start_heartbeat(void)
-{
-	pthread_t t;
-
-	if (pthread_create(&t, NULL, heartbeat, NULL) != 0) {
-		say("metal_probe: no heartbeat thread");
-		return;
-	}
-	pthread_detach(t);
-}
-
 static void
 step(const char *fmt, ...)
 {
@@ -224,6 +170,152 @@ step(const char *fmt, ...)
 	printf("\n");
 	fflush(stdout);
 }
+
+/*
+ * One rung, one process. The child prints what it is about to do, does it, prints the answer and
+ * exits. The parent prints a heartbeat every five seconds while it waits, so a log that goes
+ * quiet still says whether the parent is alive; at `secs` the child is killed and the rung is
+ * recorded as hung, which is a result and not a failure of the run.
+ */
+static int
+rung(const char *name, void (*body)(void), unsigned secs)
+{
+	pid_t pid;
+	unsigned waited = 0;
+	int status = 0;
+
+	step("--- %s (timeout %us)", name, secs);
+	fflush(stdout);
+	pid = fork();
+	if (pid < 0) {
+		step("  fork failed: %s", strerror(errno));
+		return -1;
+	}
+	if (pid == 0) {
+		/* the child: its own alarm so the stack is dumped before the parent's SIGKILL */
+		install_handlers();
+		alarm(secs > 3 ? secs - 2 : secs);
+		body();
+		alarm(0);
+		fflush(stdout);
+		_exit(0);
+	}
+	for (;;) {
+		pid_t r = waitpid(pid, &status, WNOHANG);
+
+		if (r == pid) {
+			break;
+		}
+		if (r < 0) {
+			step("  waitpid failed: %s", strerror(errno));
+			return -1;
+		}
+		if (waited >= secs * 4) {
+			step("  >>> %s: HUNG for %us, child %d killed", name, secs, (int) pid);
+			kill(pid, SIGKILL);
+			waitpid(pid, &status, 0);
+			return 1;
+		}
+		usleep(250000);
+		waited++;
+		if (waited % 20 == 0) {
+			step("  ... %s still running (%us), parent alive", name, waited / 4);
+		}
+	}
+	if (WIFSIGNALED(status)) {
+		step("  <<< %s: child died on signal %d", name, WTERMSIG(status));
+		return 2;
+	}
+	step("  <<< %s: returned, exit %d", name, WEXITSTATUS(status));
+	return 0;
+}
+
+/* ---- the rungs themselves ---- */
+
+static void
+rung_oslog(void)
+{
+	os_log_t log = os_log_create("com.redwood.probe", "rung");
+
+	step("  os_log_create -> %p", (void *) log);
+}
+
+static void
+rung_cfpath(void)
+{
+	/* The public entry to the same walk Metal makes (NSSearchPathForDirectoriesInDomains
+	 * calls CFCopySearchPathForDirectoriesInDomains, which is what frame #18 was). */
+	NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory,
+	    NSUserDomainMask, YES);
+
+	step("  NSSearchPathForDirectoriesInDomains -> %p (%lu paths)",
+	    (__bridge void *) paths, (unsigned long) [paths count]);
+}
+
+/* Metal's own base class, with nothing of this driver in the way: if this hangs, the driver is
+ * irrelevant and the repair is below it. */
+static void
+rung_mtldevice_init(void)
+{
+	Class base = NSClassFromString(@"_MTLDevice");
+	id obj;
+
+	if (base == Nil) {
+		step("  no _MTLDevice class");
+		return;
+	}
+	obj = [[base alloc] init];
+	step("  [[_MTLDevice alloc] init] -> %p", (__bridge void *) obj);
+}
+
+static void
+rung_direct_init(void)
+{
+	Class c = NSClassFromString(@"RedwoodMetalDevice");
+	id<RWProbeDevice> dev;
+
+	if (c == Nil) {
+		step("  no class");
+		return;
+	}
+	dev = [(id<RWProbeDevice>) [c alloc] initWithAcceleratorPort:gService];
+	step("  -initWithAcceleratorPort: -> %p", (__bridge void *) dev);
+	if (dev != nil) {
+		step("  name = %s", [[(id<MTLDevice>) dev name] UTF8String] ?: "(null)");
+		step("  featureProfile = %lu", (unsigned long) [dev featureProfile]);
+		step("  maxBufferLength = %llu", (unsigned long long) [dev maxBufferLength]);
+	}
+}
+
+static void
+rung_mtl_device(void)
+{
+	id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+
+	step("  MTLCreateSystemDefaultDevice -> %p", (__bridge void *) dev);
+	if (dev != nil) {
+		step("  name = %s", [[dev name] UTF8String] ?: "(null)");
+		step("  registryID = %llu", (unsigned long long) [dev registryID]);
+	}
+}
+
+static void
+rung_direct_init_noactivity(void)
+{
+	setenv("OS_ACTIVITY_MODE", "disable", 1);
+	step("  OS_ACTIVITY_MODE=%s", getenv("OS_ACTIVITY_MODE") ?: "(unset)");
+	rung_direct_init();
+}
+
+static void
+rung_mtl_device_noactivity(void)
+{
+	setenv("OS_ACTIVITY_MODE", "disable", 1);
+	step("  OS_ACTIVITY_MODE=%s", getenv("OS_ACTIVITY_MODE") ?: "(unset)");
+	rung_mtl_device();
+}
+
+/* ---- the property channel, unchanged from v1 ---- */
 
 static CFTypeRef
 copy_prop(io_service_t service, const char *key)
@@ -325,37 +417,31 @@ int
 main(int argc, char **argv)
 {
 	const char *mode = argc > 1 ? argv[1] : "run";
-	io_service_t service;
 	pid_t bb, sb;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	install_handlers();
-	start_heartbeat();
 	step("start, mode=%s, uid=%d", mode, getuid());
 
-	mark(1, "IOAcceleratorES lookup");
 	step("STEP 1: looking for IOAcceleratorES");
-	service = IOServiceGetMatchingService(0, IOServiceMatching("IOAcceleratorES"));
-	if (service == IO_OBJECT_NULL) {
+	gService = IOServiceGetMatchingService(0, IOServiceMatching("IOAcceleratorES"));
+	if (gService == IO_OBJECT_NULL) {
 		step("  no IOAcceleratorES service -- nothing below this can work");
 		return 1;
 	}
 	step("  got it");
 
-	mark(2, "properties now");
 	step("STEP 2: properties now");
-	show_prop(service, kPluginNameKey);
-	show_prop(service, kPluginClassKey);
+	show_prop(gService, kPluginNameKey);
+	show_prop(gService, kPluginClassKey);
 
 	if (strcmp(mode, "keep") != 0) {
-		mark(3, "set properties");
 		step("STEP 3: setting them");
-		set_both(service, "RedwoodMetal", "RedwoodMetalDevice");
-		show_prop(service, kPluginNameKey);
-		show_prop(service, kPluginClassKey);
+		set_both(gService, "RedwoodMetal", "RedwoodMetalDevice");
+		show_prop(gService, kPluginNameKey);
+		show_prop(gService, kPluginClassKey);
 	}
 
-	mark(4, "the bundle path");
 	step("STEP 4: the path Metal composes");
 	{
 		const char *p = "/System/Library/Extensions/RedwoodMetal.bundle";
@@ -364,7 +450,6 @@ main(int argc, char **argv)
 		step("  %s: %s", e, access(e, F_OK) == 0 ? "there" : "NOT THERE");
 	}
 
-	mark(5, "dlopen the bundle");
 	step("STEP 5: dlopen the bundle executable ourselves");
 	{
 		void *h = dlopen("/System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal",
@@ -377,7 +462,6 @@ main(int argc, char **argv)
 		}
 	}
 
-	mark(6, "class and protocol");
 	step("STEP 6: look the class up");
 	{
 		Protocol *spi = objc_getProtocol("MTLDeviceSPI");
@@ -399,60 +483,27 @@ main(int argc, char **argv)
 			    [c instancesRespondToSelector:sel_getUid("featureProfile")] ? "yes" : "NO");
 			step("  instancesRespondTo maxBufferLength = %s",
 			    [c instancesRespondToSelector:sel_getUid("maxBufferLength")] ? "yes" : "NO");
-			step("  instancesRespondTo supportsVertexAmplificationCount: = %s",
-			    [c instancesRespondToSelector:sel_getUid("supportsVertexAmplificationCount:")] ?
-			    "yes" : "NO");
 		}
 	}
 
-	/* The split that matters: this is our driver alone, with no Metal registration around it.
-	 * If the log stops here, the repair is in redwoodmetal.m; if STEP 7 answers, the driver is
-	 * fine and the hang at STEP 8 is Metal's own doing. */
-	mark(7, "direct -initWithAcceleratorPort:");
-	step("STEP 7: our class, instantiated directly (no Metal in the way)");
-	{
-		Class c = NSClassFromString(@"RedwoodMetalDevice");
+	/* The six isolates. Order matters: the cheapest way to tell "os_log is the cause" from
+	 * "os_log is just the first thing that logs" is to ask os_log by itself, before Metal. */
+	step("STEP 7: the rungs, one process each");
+	rung("A: os_log_create", rung_oslog, 12);
+	rung("B: NSSearchPathForDirectoriesInDomains", rung_cfpath, 12);
+	rung("C: [[_MTLDevice alloc] init] -- Metal's own, no driver", rung_mtldevice_init, 25);
+	rung("D: -initWithAcceleratorPort: as it is", rung_direct_init, 25);
+	rung("E: -initWithAcceleratorPort: with OS_ACTIVITY_MODE=disable",
+	    rung_direct_init_noactivity, 25);
+	rung("F: MTLCreateSystemDefaultDevice as it is", rung_mtl_device, 25);
+	rung("G: MTLCreateSystemDefaultDevice with OS_ACTIVITY_MODE=disable",
+	    rung_mtl_device_noactivity, 25);
 
-		if (c == Nil) {
-			step("  no class -- skipped");
-		} else {
-			id<RWProbeDevice> dev;
-
-			watch(20);
-			dev = [(id<RWProbeDevice>) [c alloc] initWithAcceleratorPort:service];
-			watch(0);
-			step("  -initWithAcceleratorPort: returned %p", (__bridge void *) dev);
-			if (dev != nil) {
-				step("  name = %s", [[(id<MTLDevice>) dev name] UTF8String] ?: "(null)");
-				step("  featureProfile = %lu", (unsigned long) [dev featureProfile]);
-				step("  maxBufferLength = %llu",
-				    (unsigned long long) [dev maxBufferLength]);
-			}
-		}
-	}
-
-	mark(8, "MTLCreateSystemDefaultDevice");
-	step("STEP 8: MTLCreateSystemDefaultDevice");
-	{
-		id<MTLDevice> dev;
-
-		watch(20);
-		dev = MTLCreateSystemDefaultDevice();
-		watch(0);
-		step("  device = %p", (__bridge void *) dev);
-		if (dev != nil) {
-			step("  name = %s", [[dev name] UTF8String] ?: "(null)");
-			step("  registryID = %llu", (unsigned long long) [dev registryID]);
-		}
-	}
-
-	mark(9, "the display clients");
-	step("STEP 9: the display clients");
+	step("STEP 8: the display clients");
 	bb = pid_of("backboardd");
 	sb = pid_of("SpringBoard");
 	step("  backboardd pid = %d, SpringBoard pid = %d", bb, sb);
 	if (strcmp(mode, "kick") == 0) {
-		/* our own exec is what runs late, not launchd's ordering: wait for the client to exist */
 		int i;
 		for (i = 0; i < 20 && bb <= 0; i++) {
 			sleep(2);
@@ -468,7 +519,6 @@ main(int argc, char **argv)
 		}
 	}
 
-	mark(-1, "done");
 	step("done");
 	return 0;
 }
